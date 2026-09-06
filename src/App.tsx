@@ -6356,6 +6356,20 @@ function ListView({
 
   const [expandedTasks, setExpandedTasks] = useState<Set<string>>(new Set());
 
+  // Cada linha renderizada monta subtarefas recursivas, editores de campo
+  // customizado e menus — cara demais pra montar tudo de um grupo grande de
+  // uma vez (ex.: 684 tarefas em "A Fazer" travava o navegador ao expandir).
+  // Em vez de virtualizar essa árvore recursiva (reescrita maior, sem rede de
+  // segurança de testes), cada grupo revela em lotes: só as primeiras
+  // VISIBLE_ROWS_STEP raízes desse status viram <tr>, com um botão "carregar
+  // mais" pro resto — mesmo efeito prático (nunca monta milhares de uma vez),
+  // risco bem menor.
+  const VISIBLE_ROWS_STEP = 200;
+  const [visibleRowsByStatus, setVisibleRowsByStatus] = useState<Record<string, number>>({});
+  const showMoreRows = useCallback((status: string, total: number) => {
+    setVisibleRowsByStatus((prev) => ({ ...prev, [status]: Math.min((prev[status] ?? VISIBLE_ROWS_STEP) + VISIBLE_ROWS_STEP, total) }));
+  }, []);
+
   const toggleStatus = useCallback((status: string) => {
     setExpandedStatuses((prev) => (prev.includes(status) ? prev.filter((s) => s !== status) : [...prev, status]));
   }, []);
@@ -6713,7 +6727,7 @@ function ListView({
                       </tr>
                     </thead>
                     <tbody className="divide-y">
-                      {statusTasks.flatMap((rootTask: Task) => {
+                      {statusTasks.slice(0, visibleRowsByStatus[status] ?? VISIBLE_ROWS_STEP).flatMap((rootTask: Task) => {
                         const renderRecursiveRows = (t: Task, depth: number = 0): React.ReactNode[] => {
                           if (depth >= 7) return [];
 
@@ -7013,6 +7027,15 @@ function ListView({
                       })}
                     </tbody>
                   </table>
+                )}
+                {isExpanded && statusTasks.length > (visibleRowsByStatus[status] ?? VISIBLE_ROWS_STEP) && (
+                  <button
+                    type="button"
+                    onClick={() => showMoreRows(status, statusTasks.length)}
+                    className="w-full px-4 py-3 text-xs font-semibold text-gray-500 hover:bg-gray-50 border-t border-gray-100 transition-colors"
+                  >
+                    Carregar mais {Math.min(VISIBLE_ROWS_STEP, statusTasks.length - (visibleRowsByStatus[status] ?? VISIBLE_ROWS_STEP))} de {statusTasks.length - (visibleRowsByStatus[status] ?? VISIBLE_ROWS_STEP)} restantes
+                  </button>
                 )}
               </section>
             );
