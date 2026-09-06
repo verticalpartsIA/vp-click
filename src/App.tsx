@@ -239,20 +239,34 @@ function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): 
   }
 
   // Primeiro segmento não é view conhecida → candidato a slug de espaço
-  // (/<space>[/<folder>[/<list>]]). Se não resolver (slug inválido OU
-  // índices ainda vazios porque os dados não carregaram), cai no fallback
-  // Dashboard/global — o efeito de entrada re-tenta assim que os índices
-  // ficarem prontos.
+  // (/<space>[/<folder>[/<list>]][/<view>]). Se não resolver (slug inválido
+  // OU índices ainda vazios porque os dados não carregaram), cai no
+  // fallback Dashboard/global — o efeito de entrada re-tenta assim que os
+  // índices ficarem prontos.
   const spaceId = slugMaps.spaceIndex.slugToId.get(` ${segments[0]}`);
   const space = spaceId ? slugMaps.spaces.find(s => s.id === spaceId) : undefined;
   if (!space) {
     return { view: 'Dashboard', docId: null, listId: null, scopeType: 'global', scopeId: null, scopeName: 'Dashboard', mine: false, taskId };
   }
 
+  // O último segmento pode ser a view (list/kanban/calendar/gantt/table/
+  // dashboard) em vez de espaço/pasta/lista — ex.: /suprimentos/kanban ou
+  // /suprimentos/importacao/kanban. Separa antes de resolver pasta/lista.
+  const scopeSegments = segments.slice(1);
+  let viewSlug: string | null = null;
+  if (scopeSegments.length > 0) {
+    const last = scopeSegments[scopeSegments.length - 1];
+    const candidateView = SLUG_TO_VIEW[last];
+    if (candidateView && WORKSPACE_VIEWS.includes(candidateView)) {
+      viewSlug = last;
+      scopeSegments.pop();
+    }
+  }
+
   let folderId: string | null = null;
   let folderName = '';
-  if (segments[1]) {
-    const resolvedFolderId = slugMaps.folderIndex.slugToId.get(`${space.id} ${segments[1]}`);
+  if (scopeSegments[0]) {
+    const resolvedFolderId = slugMaps.folderIndex.slugToId.get(`${space.id} ${scopeSegments[0]}`);
     const folder = resolvedFolderId ? slugMaps.folders.find(f => f.id === resolvedFolderId) : undefined;
     if (folder) {
       folderId = folder.id;
@@ -261,8 +275,8 @@ function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): 
   }
 
   let listId: string | null = null;
-  if (folderId && segments[2]) {
-    const resolvedListId = slugMaps.listIndex.slugToId.get(`${folderId} ${segments[2]}`);
+  if (folderId && scopeSegments[1]) {
+    const resolvedListId = slugMaps.listIndex.slugToId.get(`${folderId} ${scopeSegments[1]}`);
     if (resolvedListId && slugMaps.lists.some(l => l.id === resolvedListId)) {
       listId = resolvedListId;
     }
@@ -271,10 +285,13 @@ function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): 
   // Dashboard (Overview) só existe pra escopo de ESPAÇO (SpaceOverview) — não
   // há um "FolderOverview". O próprio handleNavigate já força `List` ao
   // navegar pra pasta/lista pelo clique da sidebar; replicamos a mesma regra
-  // aqui pro default de uma URL sem `?view=` explícito, senão pasta/lista sem
-  // view na URL cai no Dashboard GLOBAL (sem filtro de escopo) por engano.
-  const viewParam = params.get('view');
-  const view = (viewParam && SLUG_TO_VIEW[viewParam]) || (folderId ? 'List' : 'Dashboard');
+  // aqui pro default de uma URL sem segmento de view explícito, senão
+  // pasta/lista sem view cai no Dashboard GLOBAL (sem filtro de escopo) por
+  // engano. `?view=` continua aceito como fallback de link antigo.
+  const legacyViewParam = params.get('view');
+  const view = (viewSlug && SLUG_TO_VIEW[viewSlug])
+    || (legacyViewParam && SLUG_TO_VIEW[legacyViewParam])
+    || (folderId ? 'List' : 'Dashboard');
   const scopeType: ScopeType = listId ? 'global' : folderId ? 'folder' : 'space';
   const scopeId = listId ? null : folderId ?? space.id;
   const scopeName = listId ? '' : folderId ? folderName : space.name;
@@ -353,8 +370,13 @@ function computeNavPath(
       const listSlug = state.activeListId ? slugMaps.listIndex.idToSlug.get(state.activeListId) : undefined;
       if (listSlug) pathParts.push(listSlug);
     }
-    if (state.activeView !== 'Dashboard') {
-      params.set('view', VIEW_TO_SLUG[state.activeView] ?? '');
+    // View vira segmento de path (/suprimentos/kanban,
+    // /suprimentos/importacao/kanban) — só quando difere do default do
+    // escopo: Dashboard (Overview) pra espaço puro, List pra pasta/lista
+    // (não existe Overview de pasta — mesma regra de parseNavPath).
+    const defaultView: ActiveView = folderSlug ? 'List' : 'Dashboard';
+    if (state.activeView !== defaultView) {
+      pathParts.push(VIEW_TO_SLUG[state.activeView] || 'dashboard');
     }
     const search = params.toString();
     return `/${pathParts.join('/')}${search ? `?${search}` : ''}`;
