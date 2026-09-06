@@ -127,6 +127,33 @@ describe('skip de fins de semana', () => {
   });
 });
 
+describe('feriados (skip_holidays)', () => {
+  it('weekend_shift=next_business_day desloca feriado numa terça pra quarta', () => {
+    const rule: RecurrenceRuleForCalc = { ...baseRule, skipHolidays: true, weekendShift: 'next_business_day' };
+    const holidays = new Set(['2026-09-08']); // terça, feriado fictício
+    const after = new Date('2026-09-07T12:00:00Z'); // segunda -> próxima seria terça (feriado)
+    const next = calcNextOccurrence(rule, after, startAt, holidays);
+    expect(next?.toISOString()).toBe('2026-09-09T12:00:00.000Z'); // quarta
+  });
+
+  it('feriado emendado com fim de semana pula os 3 dias seguidos', () => {
+    // 2026-09-11 é sexta (feriado), 12/13 é fim de semana.
+    const rule: RecurrenceRuleForCalc = { ...baseRule, skipWeekends: true, skipHolidays: true, weekendShift: 'next_business_day' };
+    const holidays = new Set(['2026-09-11']);
+    const after = new Date('2026-09-10T12:00:00Z'); // quinta -> próxima seria sexta (feriado)
+    const next = calcNextOccurrence(rule, after, startAt, holidays);
+    expect(next?.toISOString()).toBe('2026-09-14T12:00:00.000Z'); // segunda seguinte
+  });
+
+  it('sem skipHolidays, data em feriado não é deslocada', () => {
+    const rule: RecurrenceRuleForCalc = { ...baseRule, skipHolidays: false };
+    const holidays = new Set(['2026-09-08']);
+    const after = new Date('2026-09-07T12:00:00Z');
+    const next = calcNextOccurrence(rule, after, startAt, holidays);
+    expect(next?.toISOString()).toBe('2026-09-08T12:00:00.000Z'); // não desloca
+  });
+});
+
 describe('timezone', () => {
   it('mantém a hora do dia (wall clock) estável através dos meses', () => {
     const rule: RecurrenceRuleForCalc = { ...baseRule, frequencyType: 'monthly', monthDay: 7 };

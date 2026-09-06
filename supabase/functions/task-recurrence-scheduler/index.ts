@@ -41,6 +41,7 @@ interface RuleRow {
   timezone: string;
   trigger_mode: string;
   skip_weekends: boolean;
+  skip_holidays: boolean;
   weekend_shift: string;
   end_mode: string;
   end_at: string | null;
@@ -61,13 +62,14 @@ function toRuleForCalc(rule: RuleRow): RecurrenceRuleForCalc {
     monthWeekday: rule.month_weekday,
     timezone: rule.timezone,
     skipWeekends: rule.skip_weekends,
+    skipHolidays: rule.skip_holidays,
     weekendShift: rule.weekend_shift as RecurrenceRuleForCalc['weekendShift'],
   };
 }
 
 // Junta as ocorrências agendadas <= now a partir de next_run_at, e devolve
 // junto o próximo horário FUTURO (o que vira o novo next_run_at da regra).
-function collectDueOccurrences(rule: RuleRow, nowMs: number): { due: Date[]; following: Date | null } {
+function collectDueOccurrences(rule: RuleRow, nowMs: number, holidays: ReadonlySet<string>): { due: Date[]; following: Date | null } {
   const ruleForCalc = toRuleForCalc(rule);
   const startAt = new Date(rule.start_at);
   const due: Date[] = [];
@@ -75,7 +77,7 @@ function collectDueOccurrences(rule: RuleRow, nowMs: number): { due: Date[]; fol
   let guard = 0;
   while (cursor.getTime() <= nowMs && guard < 200) {
     due.push(cursor);
-    const next = calcNextValidOccurrence(ruleForCalc, cursor, startAt);
+    const next = calcNextValidOccurrence(ruleForCalc, cursor, startAt, holidays);
     if (!next) return { due, following: null }; // esgotou tentativas (weekend_shift=skip sem saída)
     cursor = next;
     guard++;
@@ -107,6 +109,99 @@ async function fetchLatestOccurrenceTask(admin: any, rule: RuleRow) {
     .limit(1)
     .maybeSingle();
   return data;
+}
+
+// Clona checklist items de uma tarefa pra outra. `keepCheckedState=false`
+// (inherit.includeChecklistCheckedState) reseta tudo pra "não concluído" —
+// a nova ocorrência começa do zero por padrão.
+async function cloneChecklists(admin: any, fromTaskId: string, toTaskId: string, keepCheckedState: boolean) {
+  const { data: src } = await admin.from('task_checklists').select('text,completed').eq('task_id', fromTaskId);
+  if (!src || src.length === 0) return;
+  await admin.from('task_checklists').insert(
+    (src as { text: string; completed: boolean }[]).map((it) => ({
+      task_id: toTaskId, text: it.text, completed: keepCheckedState ? it.completed : false,
+    })),
+  );
+}
+
+async function cloneCustomFields(admin: any, fromEntityId: string, toEntityId: string) {
+  const { data: src } = await admin.from('custom_field_values').select('field_id,value').eq('entity_id', fromEntityId);
+  if (!src || src.length === 0) return;
+  await admin.from('custom_field_values').insert(
+    (src as { field_id: string; value: unknown }[]).map((v) => ({ field_id: v.field_id, entity_id: toEntityId, value: v.value })),
+  );
+}
+
+async function cloneWatchers(admin: any, fromTaskId: string, toTaskId: string) {
+  const { data: src } = await admin.from('task_watchers').select('user_id').eq('task_id', fromTaskId);
+  if (!src || src.length === 0) return;
+  await admin.from('task_watchers').insert(
+    (src as { user_id: string }[]).map((w) => ({ task_id: toTaskId, user_id: w.user_id })),
+  );
+}
+
+// Preserva o offset da subtarefa em relação à tarefa-pai (issue #184 seção 8)
+// — NÃO copia a data absoluta antiga. `anchorOriginal`/`anchorNew` são as
+// datas (due_date preferencialmente, senão start_date) da tarefa-pai antes e
+// depois da recorrência; se a subtarefa ou o pai não tiverem uma data de
+// referência, a data correspondente da subtarefa fica null (evita "datas
+// fantasma" erradas em vez de arriscar um remapeamento sem base).
+function remapDate(dateStr: string | null, anchorOriginal: Date | null, anchorNew: Date | null): string | null {
+  if (!dateStr || !anchorOriginal || !anchorNew) return null;
+  const offsetMs = new Date(dateStr).getTime() - anchorOriginal.getTime();
+  return new Date(anchorNew.getTime() + offsetMs).toISOString();
+}
+
+// Clona as subtarefas DIRETAS da tarefa-modelo pra nova ocorrência. Reaproveita
+// as mesmas funções de clonagem de checklist/custom fields/watchers — não
+// duplica a lógica de DuplicateTaskOptions (client-side), só espelha o mesmo
+// conjunto de operações no contexto server-side do scheduler.
+async function cloneSubtasks(
+  admin: any,
+  parentSourceId: string,
+  parentNewId: string,
+  listId: string,
+  createdBy: string | null,
+  inherit: Record<string, boolean>,
+  anchorOriginal: Date | null,
+  anchorNew: Date | null,
+) {
+  const { data: subtasks } = await admin
+    .from('tasks')
+    .select('id,title,description,priority,main_assignee_id,secondary_assignee_ids,start_date,due_date,tags,status')
+    .eq('parent_id', parentSourceId);
+  if (!subtasks || subtasks.length === 0) return;
+
+  for (const sub of subtasks as any[]) {
+    const startDate = inherit.remapSubtaskDates ? remapDate(sub.start_date, anchorOriginal, anchorNew) : null;
+    const dueDate = inherit.remapSubtaskDates ? remapDate(sub.due_date, anchorOriginal, anchorNew) : null;
+
+    const { data: insertedSub, error: subErr } = await admin
+      .from('tasks')
+      .insert({
+        title: sub.title,
+        description: inherit.includeDescription ? sub.description : '',
+        status: sub.status,
+        priority: inherit.includePriority ? sub.priority : 'Media',
+        main_assignee_id: inherit.includeAssignees ? sub.main_assignee_id : null,
+        secondary_assignee_ids: inherit.includeAssignees ? (sub.secondary_assignee_ids || []) : [],
+        start_date: startDate,
+        due_date: dueDate,
+        list_id: listId,
+        parent_id: parentNewId,
+        tags: inherit.includeTags ? (sub.tags || []) : [],
+        created_by: createdBy,
+      })
+      .select('id')
+      .single();
+    if (subErr || !insertedSub) {
+      console.error(`[task-recurrence-scheduler] falha ao clonar subtarefa ${sub.id}: ${subErr?.message}`);
+      continue;
+    }
+    if (inherit.includeChecklists) await cloneChecklists(admin, sub.id, insertedSub.id, !!inherit.includeChecklistCheckedState);
+    if (inherit.includeCustomFields) await cloneCustomFields(admin, sub.id, insertedSub.id);
+    if (inherit.includeWatchers) await cloneWatchers(admin, sub.id, insertedSub.id);
+  }
 }
 
 async function createOccurrenceTask(
@@ -174,6 +269,18 @@ async function createOccurrenceTask(
     if (error.code === '23505') return { alreadyExists: true };
     return { error: error.message };
   }
+
+  if (inherit.includeChecklists) await cloneChecklists(admin, rule.task_id, inserted.id, !!inherit.includeChecklistCheckedState);
+  if (inherit.includeCustomFields) await cloneCustomFields(admin, rule.task_id, inserted.id);
+  if (inherit.includeWatchers) await cloneWatchers(admin, rule.task_id, inserted.id);
+  if (inherit.includeSubtasks) {
+    // Âncora do remapeamento (seção 8/9 da issue): due_date preferencialmente
+    // (é a data que toda tarefa recorrente tem garantida), senão start_date.
+    const anchorOriginal = template.due_date ? new Date(template.due_date) : (template.start_date ? new Date(template.start_date) : null);
+    const anchorNew = dueDate ? new Date(dueDate) : (startDate ? new Date(startDate) : null);
+    await cloneSubtasks(admin, rule.task_id, inserted.id, rule.list_id, rule.created_by, inherit, anchorOriginal, anchorNew);
+  }
+
   // user_id é NOT NULL em task_activities — regra sem created_by (ex.: task
   // de import legado, sem criador) não gera esse registro de atividade,
   // mas isso não impede a criação da tarefa em si.
@@ -189,8 +296,8 @@ async function createOccurrenceTask(
   return { taskId: inserted.id };
 }
 
-async function processRule(admin: any, rule: RuleRow, nowMs: number) {
-  const { due, following } = collectDueOccurrences(rule, nowMs);
+async function processRule(admin: any, rule: RuleRow, nowMs: number, holidays: ReadonlySet<string>) {
+  const { due, following } = collectDueOccurrences(rule, nowMs, holidays);
   const toCreate = applyMisfirePolicy(due, rule.misfire_policy);
 
   const latest = await fetchLatestOccurrenceTask(admin, rule);
@@ -277,13 +384,18 @@ Deno.serve(async (req: Request) => {
   if (rulesErr) return json({ error: rulesErr.message }, 500);
   if (!rules || rules.length === 0) return json({ processed: 0, created: 0 });
 
+  // Calendário corporativo (issue #184 seção 11) — uma leitura por invocação,
+  // reaproveitada por todas as regras processadas neste tick.
+  const { data: holidayRows } = await admin.from('company_holidays').select('date');
+  const holidays = new Set<string>((holidayRows || []).map((h: { date: string }) => h.date));
+
   let totalCreated = 0;
   let processed = 0;
   const errors: string[] = [];
 
   for (const rule of rules as RuleRow[]) {
     try {
-      const result = await processRule(admin, rule, nowMs);
+      const result = await processRule(admin, rule, nowMs, holidays);
       processed += 1;
       if ('postponed' in result && result.postponed) continue; // não atualiza next_run_at
 

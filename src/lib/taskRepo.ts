@@ -1052,6 +1052,7 @@ export interface RecurrenceRuleInput {
   nextRunAt: string | null;
   timezone: string;
   skipWeekends: boolean;
+  skipHolidays: boolean;
   weekendShift: TaskRecurrenceRule['weekendShift'];
   endMode: TaskRecurrenceRule['endMode'];
   endAt?: string | null;
@@ -1084,6 +1085,7 @@ export async function upsertRecurrenceRule(
     timezone: input.timezone,
     trigger_mode: 'on_schedule',
     skip_weekends: input.skipWeekends,
+    skip_holidays: input.skipHolidays,
     weekend_shift: input.weekendShift,
     end_mode: input.endMode,
     end_at: input.endAt ?? null,

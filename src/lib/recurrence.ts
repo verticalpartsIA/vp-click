@@ -21,6 +21,7 @@ export interface RecurrenceRuleForCalc {
   monthWeekday?: number | null; // 0..6, usado com monthWeek
   timezone: string; // IANA, ex.: 'America/Sao_Paulo'
   skipWeekends: boolean;
+  skipHolidays?: boolean;
   weekendShift: RecurrenceWeekendShift;
 }
 
@@ -87,24 +88,42 @@ function addMonths(wall: WallClock, months: number): WallClock {
   return { ...wall, year, month };
 }
 
-// ── Fins de semana ────────────────────────────────────────────────────────
+// ── Fins de semana e feriados ────────────────────────────────────────────
 function isWeekend(year: number, month: number, day: number): boolean {
   const dow = weekdayOf(year, month, day);
   return dow === 0 || dow === 6;
 }
 
-// Aplica skip_weekends/weekend_shift a um wall-clock já calculado. Nunca
-// muta a data de origem da regra — só desloca a OCORRÊNCIA gerada.
-function applyWeekendShift(wall: WallClock, rule: RecurrenceRuleForCalc): WallClock | null {
-  if (!rule.skipWeekends || !isWeekend(wall.year, wall.month, wall.day)) return wall;
+function dateKey(year: number, month: number, day: number): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${year}-${pad(month)}-${pad(day)}`;
+}
+
+function isNonBusinessDay(
+  year: number, month: number, day: number,
+  rule: RecurrenceRuleForCalc, holidays: ReadonlySet<string> | undefined,
+): boolean {
+  if (rule.skipWeekends && isWeekend(year, month, day)) return true;
+  if (rule.skipHolidays && holidays?.has(dateKey(year, month, day))) return true;
+  return false;
+}
+
+// Aplica skip_weekends/skip_holidays/weekend_shift a um wall-clock já
+// calculado. Nunca muta a data de origem da regra — só desloca a OCORRÊNCIA
+// gerada. `holidays` é o calendário corporativo (issue #184 seção 11) — vem
+// de fora (banco), não é hardcoded aqui; ausente/vazio = nenhum feriado.
+function applyWeekendShift(
+  wall: WallClock, rule: RecurrenceRuleForCalc, holidays?: ReadonlySet<string>,
+): WallClock | null {
+  if (!isNonBusinessDay(wall.year, wall.month, wall.day, rule, holidays)) return wall;
 
   if (rule.weekendShift === 'skip') return null;
 
   const stepDays = rule.weekendShift === 'previous_business_day' ? -1 : 1;
   let { year, month, day } = wall;
-  // No máximo 2 passos pra sair de um fim de semana (sáb->seg ou dom->seg,
-  // e o espelho pro lado "previous").
-  for (let i = 0; i < 2 && isWeekend(year, month, day); i++) {
+  // Teto de 10 passos: cobre feriados emendados com fim de semana (ex.:
+  // feriado na sexta + sábado + domingo = 3 dias não-úteis seguidos).
+  for (let i = 0; i < 10 && isNonBusinessDay(year, month, day, rule, holidays); i++) {
     const next = new Date(Date.UTC(year, month - 1, day + stepDays));
     year = next.getUTCFullYear();
     month = next.getUTCMonth() + 1;
@@ -191,18 +210,22 @@ function nextYearlyDate(afterWall: WallClock, rule: RecurrenceRuleForCalc, start
 
 /**
  * Calcula a PRÓXIMA ocorrência estritamente depois de `after`, respeitando
- * frequência, fuso horário e skip_weekends/weekend_shift da regra.
- * `startAt` ancora dia-do-mês (yearly) e hora do dia (todas as frequências
- * usam a hora de startAt, só a data muda).
+ * frequência, fuso horário e skip_weekends/skip_holidays/weekend_shift da
+ * regra. `startAt` ancora dia-do-mês (yearly) e hora do dia (todas as
+ * frequências usam a hora de startAt, só a data muda). `holidays` é o
+ * calendário corporativo (datas 'YYYY-MM-DD' no fuso da regra) — vem de
+ * fora (tabela `company_holidays`), esta função não conhece feriados por si.
  *
  * Retorna `null` só quando weekend_shift = 'skip' e a ocorrência calculada
- * cair um fim de semana (a ocorrência é pulada, não adiada — use
- * calcNextValidOccurrence pra já pular automaticamente até achar uma válida).
+ * cair num dia não-útil (fim de semana ou feriado) — a ocorrência é pulada,
+ * não adiada — use calcNextValidOccurrence pra já pular automaticamente até
+ * achar uma válida.
  */
 export function calcNextOccurrence(
   rule: RecurrenceRuleForCalc,
   after: Date,
   startAt: Date,
+  holidays?: ReadonlySet<string>,
 ): Date | null {
   const afterWall = utcToWallClock(after, rule.timezone);
   const startWall = utcToWallClock(startAt, rule.timezone);
@@ -229,25 +252,26 @@ export function calcNextOccurrence(
   // Hora do dia vem de startAt, não de `after`.
   dateWall = { ...dateWall, hour: startWall.hour, minute: startWall.minute, second: startWall.second };
 
-  const shifted = applyWeekendShift(dateWall, rule);
-  if (!shifted) return null; // weekend_shift = 'skip' e caiu em fim de semana
+  const shifted = applyWeekendShift(dateWall, rule, holidays);
+  if (!shifted) return null; // caiu em dia não-útil e weekend_shift = 'skip'
   return wallClockToUtc(shifted, rule.timezone);
 }
 
 /**
  * Como calcNextOccurrence, mas quando weekend_shift='skip' pula ocorrências
- * em fim de semana até achar uma válida (ou até o teto de segurança).
+ * em dia não-útil até achar uma válida (ou até o teto de segurança).
  */
 export function calcNextValidOccurrence(
   rule: RecurrenceRuleForCalc,
   after: Date,
   startAt: Date,
+  holidays?: ReadonlySet<string>,
 ): Date | null {
   let cursor = after;
   for (let i = 0; i < 366; i++) { // teto de segurança: 1 ano de tentativas diárias
-    const next = calcNextOccurrence(rule, cursor, startAt);
+    const next = calcNextOccurrence(rule, cursor, startAt, holidays);
     if (next === null) {
-      // Ocorrência caiu em fim de semana e foi pulada — avança 1 dia e
+      // Ocorrência caiu em dia não-útil e foi pulada — avança 1 dia e
       // tenta de novo (suficiente pra diária/semanal; mensal/anual
       // recalculam do zero a cada tentativa, então isso só força uma nova
       // rodada de busca).

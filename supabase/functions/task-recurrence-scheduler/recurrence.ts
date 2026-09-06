@@ -16,6 +16,7 @@ export interface RecurrenceRuleForCalc {
   monthWeekday?: number | null;
   timezone: string;
   skipWeekends: boolean;
+  skipHolidays?: boolean;
   weekendShift: RecurrenceWeekendShift;
 }
 
@@ -76,12 +77,28 @@ function isWeekend(year: number, month: number, day: number): boolean {
   return dow === 0 || dow === 6;
 }
 
-function applyWeekendShift(wall: WallClock, rule: RecurrenceRuleForCalc): WallClock | null {
-  if (!rule.skipWeekends || !isWeekend(wall.year, wall.month, wall.day)) return wall;
+function dateKey(year: number, month: number, day: number): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${year}-${pad(month)}-${pad(day)}`;
+}
+
+function isNonBusinessDay(
+  year: number, month: number, day: number,
+  rule: RecurrenceRuleForCalc, holidays: ReadonlySet<string> | undefined,
+): boolean {
+  if (rule.skipWeekends && isWeekend(year, month, day)) return true;
+  if (rule.skipHolidays && holidays?.has(dateKey(year, month, day))) return true;
+  return false;
+}
+
+function applyWeekendShift(
+  wall: WallClock, rule: RecurrenceRuleForCalc, holidays?: ReadonlySet<string>,
+): WallClock | null {
+  if (!isNonBusinessDay(wall.year, wall.month, wall.day, rule, holidays)) return wall;
   if (rule.weekendShift === 'skip') return null;
   const stepDays = rule.weekendShift === 'previous_business_day' ? -1 : 1;
   let { year, month, day } = wall;
-  for (let i = 0; i < 2 && isWeekend(year, month, day); i++) {
+  for (let i = 0; i < 10 && isNonBusinessDay(year, month, day, rule, holidays); i++) {
     const next = new Date(Date.UTC(year, month - 1, day + stepDays));
     year = next.getUTCFullYear();
     month = next.getUTCMonth() + 1;
@@ -155,6 +172,7 @@ export function calcNextOccurrence(
   rule: RecurrenceRuleForCalc,
   after: Date,
   startAt: Date,
+  holidays?: ReadonlySet<string>,
 ): Date | null {
   const afterWall = utcToWallClock(after, rule.timezone);
   const startWall = utcToWallClock(startAt, rule.timezone);
@@ -180,7 +198,7 @@ export function calcNextOccurrence(
 
   dateWall = { ...dateWall, hour: startWall.hour, minute: startWall.minute, second: startWall.second };
 
-  const shifted = applyWeekendShift(dateWall, rule);
+  const shifted = applyWeekendShift(dateWall, rule, holidays);
   if (!shifted) return null;
   return wallClockToUtc(shifted, rule.timezone);
 }
@@ -189,10 +207,11 @@ export function calcNextValidOccurrence(
   rule: RecurrenceRuleForCalc,
   after: Date,
   startAt: Date,
+  holidays?: ReadonlySet<string>,
 ): Date | null {
   let cursor = after;
   for (let i = 0; i < 366; i++) {
-    const next = calcNextOccurrence(rule, cursor, startAt);
+    const next = calcNextOccurrence(rule, cursor, startAt, holidays);
     if (next === null) {
       cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000);
       continue;

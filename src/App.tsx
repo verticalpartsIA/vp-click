@@ -10,6 +10,8 @@ import {
 // import { MOCK_USERS, INITIAL_WORKSPACE, MOCK_SPACES, MOCK_FOLDERS, MOCK_LISTS, MOCK_TASKS, MOCK_PROJECTS, MOCK_CUSTOM_FIELDS, MOCK_CUSTOM_FIELD_VALUES } from './mockData';
 import { INITIAL_WORKSPACE, MOCK_PROJECTS } from './mockData'; // MOCK_PROJECTS temporário se ainda necessário
 import { Icons, PRIORITY_COLORS, COLORS } from './constants';
+import { calcNextValidOccurrence, RecurrenceRuleForCalc } from './lib/recurrence';
+import { fetchCompanyHolidays, addCompanyHoliday, deleteCompanyHoliday, CompanyHoliday } from './lib/holidaysRepo';
 import { WIKI_INTRO_HTML, WIKI_TEMPLATE_SECTIONS } from './wikiTemplate';
 import LoginScreen from './pages/LoginScreen';
 import ChangePasswordModal from './components/ChangePasswordModal';
@@ -4452,6 +4454,7 @@ export default function App() {
           onSave={handleSaveRecurrenceRule}
           onToggleEnabled={handleToggleRecurrenceEnabled}
           onDelete={handleDeleteRecurrenceRule}
+          currentUser={currentUser}
         />
 
         {/* Custom Fields Manager */}
@@ -6620,6 +6623,7 @@ interface RecurrenceFormState {
   monthWeekday: number;
   startAt: string; // valor de datetime-local
   skipWeekends: boolean;
+  skipHolidays: boolean;
   weekendShift: RecurrenceWeekendShift;
   endMode: RecurrenceEndMode;
   endAt: string; // valor de date
@@ -6643,11 +6647,16 @@ function defaultRecurrenceForm(task: Task | null): RecurrenceFormState {
     monthWeekday: 1,
     startAt: toDatetimeLocalValue(now),
     skipWeekends: false,
+    skipHolidays: false,
     weekendShift: 'next_business_day',
     endMode: 'forever',
     endAt: '',
     maxOccurrences: 10,
-    inheritOptions: { includeDescription: true, includePriority: true, includeAssignees: true, includeTags: true },
+    inheritOptions: {
+      includeDescription: true, includePriority: true, includeAssignees: true, includeTags: true,
+      includeSubtasks: false, remapSubtaskDates: true, includeChecklists: false, includeChecklistCheckedState: false,
+      includeCustomFields: false, includeWatchers: false,
+    },
     overlapPolicy: 'create_and_flag',
     misfirePolicy: 'create_latest_only',
   };
@@ -6664,6 +6673,7 @@ function ruleToRecurrenceForm(rule: TaskRecurrenceRule): RecurrenceFormState {
     monthWeekday: rule.monthWeekday ?? 1,
     startAt: toDatetimeLocalValue(new Date(rule.startAt)),
     skipWeekends: rule.skipWeekends,
+    skipHolidays: rule.skipHolidays,
     weekendShift: rule.weekendShift,
     endMode: rule.endMode,
     endAt: rule.endAt ? rule.endAt.slice(0, 10) : '',
@@ -6688,6 +6698,7 @@ function RecurrenceConfigModal({
   onSave,
   onToggleEnabled,
   onDelete,
+  currentUser,
 }: {
   task: Task | null;
   rule: TaskRecurrenceRule | null;
@@ -6698,6 +6709,7 @@ function RecurrenceConfigModal({
   onSave: (input: Omit<import('./lib/taskRepo').RecurrenceRuleInput, 'taskId' | 'listId' | 'createdBy'>) => void;
   onToggleEnabled: (rule: TaskRecurrenceRule, enabled: boolean) => void;
   onDelete: (rule: TaskRecurrenceRule) => void;
+  currentUser: User;
 }) {
   const [form, setForm] = useState<RecurrenceFormState>(() => defaultRecurrenceForm(task));
 
@@ -6743,6 +6755,7 @@ function RecurrenceConfigModal({
       nextRunAt: startAtDate.toISOString(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo',
       skipWeekends: form.skipWeekends,
+      skipHolidays: form.skipHolidays,
       weekendShift: form.weekendShift,
       endMode: form.endMode,
       endAt: form.endMode === 'until' && form.endAt ? new Date(`${form.endAt}T23:59:59`).toISOString() : null,
@@ -6758,7 +6771,48 @@ function RecurrenceConfigModal({
     { key: 'includePriority', label: 'Prioridade' },
     { key: 'includeAssignees', label: 'Responsáveis' },
     { key: 'includeTags', label: 'Etiquetas' },
+    { key: 'includeSubtasks', label: 'Subtarefas' },
+    { key: 'includeChecklists', label: 'Checklists' },
+    { key: 'includeCustomFields', label: 'Campos personalizados' },
+    { key: 'includeWatchers', label: 'Observadores' },
   ];
+
+  const [isHolidaysManagerOpen, setIsHolidaysManagerOpen] = useState(false);
+
+  // Preview client-side das próximas ocorrências previstas (issue #184
+  // seção 25 — "ocorrências futuras virtuais"): calcula sem materializar
+  // nada no banco, reaproveitando o mesmo motor puro do scheduler.
+  const [holidaysForPreview, setHolidaysForPreview] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!isOpen) return;
+    fetchCompanyHolidays().then((rows) => setHolidaysForPreview(new Set(rows.map((h) => h.date))));
+  }, [isOpen]);
+
+  const upcomingPreview = useMemo(() => {
+    const startAtDate = new Date(form.startAt);
+    if (Number.isNaN(startAtDate.getTime())) return [];
+    const ruleForCalc: RecurrenceRuleForCalc = {
+      frequencyType: form.frequencyType,
+      interval: Math.max(1, form.interval),
+      weekdays: form.frequencyType === 'weekly' ? form.weekdays : [],
+      monthDay: form.frequencyType === 'monthly' && form.monthMode === 'day' ? form.monthDay : null,
+      monthWeek: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeek : null,
+      monthWeekday: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeekday : null,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo',
+      skipWeekends: form.skipWeekends,
+      skipHolidays: form.skipHolidays,
+      weekendShift: form.weekendShift,
+    };
+    const dates: Date[] = [startAtDate];
+    let cursor = startAtDate;
+    for (let i = 0; i < 4; i++) {
+      const next = calcNextValidOccurrence(ruleForCalc, cursor, startAtDate, holidaysForPreview);
+      if (!next) break;
+      dates.push(next);
+      cursor = next;
+    }
+    return dates;
+  }, [form.startAt, form.frequencyType, form.interval, form.weekdays, form.monthMode, form.monthDay, form.monthWeek, form.monthWeekday, form.skipWeekends, form.skipHolidays, form.weekendShift, holidaysForPreview]);
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
@@ -6914,6 +6968,25 @@ function RecurrenceConfigModal({
               </div>
 
               <div className="space-y-2">
+                <label className="flex items-center justify-between gap-2 text-sm font-semibold text-gray-700">
+                  <span className="flex items-center gap-2">
+                    <Checkbox checked={form.skipHolidays} onCheckedChange={(c) => setForm((prev) => ({ ...prev, skipHolidays: c === true }))} />
+                    Pular feriados
+                  </span>
+                  <button type="button" onClick={() => setIsHolidaysManagerOpen(true)} className="text-xs font-medium text-blue-500 hover:underline">
+                    Gerenciar feriados
+                  </button>
+                </label>
+              </div>
+
+              {upcomingPreview.length > 1 && (
+                <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-600">
+                  <p className="mb-1 font-semibold text-gray-700">Próximas ocorrências previstas</p>
+                  <p>{upcomingPreview.map((d) => d.toLocaleDateString('pt-BR')).join(' · ')}</p>
+                </div>
+              )}
+
+              <div className="space-y-2">
                 <label className="text-sm font-semibold text-gray-700">Encerramento</label>
                 <div className="flex gap-4 text-sm mb-2">
                   <label className="flex items-center gap-1.5"><input type="radio" checked={form.endMode === 'forever'} onChange={() => setForm((prev) => ({ ...prev, endMode: 'forever' }))} /> Nunca</label>
@@ -6949,6 +7022,18 @@ function RecurrenceConfigModal({
                     </label>
                   ))}
                 </div>
+                {form.inheritOptions.includeSubtasks && (
+                  <label className="mt-2 flex items-center gap-2 rounded-xl border border-gray-200 bg-white p-2.5 hover:border-blue-200 cursor-pointer">
+                    <Checkbox checked={Boolean(form.inheritOptions.remapSubtaskDates)} onCheckedChange={(c) => toggleInherit('remapSubtaskDates', c === true)} />
+                    <span className="text-sm text-gray-700">Remapear datas das subtarefas (preserva o intervalo em relação à tarefa-pai)</span>
+                  </label>
+                )}
+                {form.inheritOptions.includeChecklists && (
+                  <label className="mt-2 flex items-center gap-2 rounded-xl border border-gray-200 bg-white p-2.5 hover:border-blue-200 cursor-pointer">
+                    <Checkbox checked={Boolean(form.inheritOptions.includeChecklistCheckedState)} onCheckedChange={(c) => toggleInherit('includeChecklistCheckedState', c === true)} />
+                    <span className="text-sm text-gray-700">Manter itens de checklist já marcados como concluídos</span>
+                  </label>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -7010,6 +7095,121 @@ function RecurrenceConfigModal({
             </button>
           </DialogFooter>
         </form>
+      </DialogContent>
+      <HolidaysManagerModal
+        isOpen={isHolidaysManagerOpen}
+        onClose={() => setIsHolidaysManagerOpen(false)}
+        onChanged={(holidays) => setHolidaysForPreview(new Set(holidays.map((h) => h.date)))}
+        currentUser={currentUser}
+      />
+    </Dialog>
+  );
+}
+
+// Modal auxiliar do "Pular feriados" — CRUD do calendário corporativo
+// (issue #184 seção 11). Escrita restrita a is_manager() via RLS; qualquer
+// autenticado só lê (a própria regra de recorrência de um colaborador
+// precisa enxergar os feriados pra calcular o deslocamento corretamente).
+function HolidaysManagerModal({
+  isOpen,
+  onClose,
+  onChanged,
+  currentUser,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  onChanged: (holidays: CompanyHoliday[]) => void;
+  currentUser: User;
+}) {
+  const [holidays, setHolidays] = useState<CompanyHoliday[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [newDate, setNewDate] = useState('');
+  const [newName, setNewName] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+
+  const reload = async () => {
+    setIsLoading(true);
+    const rows = await fetchCompanyHolidays();
+    setHolidays(rows);
+    onChanged(rows);
+    setIsLoading(false);
+  };
+
+  useEffect(() => {
+    if (isOpen) reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
+
+  const canManage = currentUser?.role === 'ADMIN' || currentUser?.role === 'GESTOR';
+
+  const handleAdd = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newDate || !newName.trim() || isSaving) return;
+    setIsSaving(true);
+    try {
+      const res = await addCompanyHoliday(newDate, newName, currentUser.id);
+      if ('error' in res) throw new Error(res.error);
+      setNewDate('');
+      setNewName('');
+      await reload();
+    } catch (err) {
+      toast.error('Erro ao adicionar feriado: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    const { error } = await deleteCompanyHoliday(id);
+    if (error) { toast.error('Erro ao excluir feriado: ' + error); return; }
+    await reload();
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="max-w-md p-0 overflow-hidden max-h-[80vh] flex flex-col">
+        <DialogHeader className="px-6 pt-6 pb-4 border-b bg-gray-50/60 shrink-0">
+          <DialogTitle className="text-lg">Calendário de feriados</DialogTitle>
+          <DialogDescription>Usado por qualquer regra com "Pular feriados" ativado.</DialogDescription>
+        </DialogHeader>
+
+        <div className="p-6 space-y-4 overflow-y-auto">
+          {canManage && (
+            <form onSubmit={handleAdd} className="flex items-end gap-2">
+              <div className="flex-1 space-y-1">
+                <label className="text-xs font-semibold text-gray-500">Data</label>
+                <input type="date" value={newDate} onChange={(e) => setNewDate(e.target.value)} className="w-full rounded-lg border border-gray-200 px-2 py-1.5 text-sm outline-none focus:border-blue-400" />
+              </div>
+              <div className="flex-1 space-y-1">
+                <label className="text-xs font-semibold text-gray-500">Nome</label>
+                <input type="text" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Ex.: Natal" className="w-full rounded-lg border border-gray-200 px-2 py-1.5 text-sm outline-none focus:border-blue-400" />
+              </div>
+              <button type="submit" disabled={isSaving} className="px-3 py-1.5 rounded-lg bg-[var(--primary-color)] text-[#2c3e50] text-sm font-bold disabled:opacity-50">+</button>
+            </form>
+          )}
+
+          {isLoading ? (
+            <p className="text-sm text-gray-400">Carregando...</p>
+          ) : holidays.length === 0 ? (
+            <p className="text-sm text-gray-400">Nenhum feriado cadastrado ainda.</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {holidays.map((h) => (
+                <li key={h.id} className="flex items-center justify-between rounded-lg border border-gray-100 bg-gray-50 px-3 py-2 text-sm">
+                  <span>
+                    <span className="font-semibold text-gray-700">{new Date(`${h.date}T00:00:00`).toLocaleDateString('pt-BR')}</span>
+                    <span className="text-gray-500"> — {h.name}</span>
+                  </span>
+                  {canManage && (
+                    <button type="button" onClick={() => handleDelete(h.id)} className="text-gray-400 hover:text-red-500">
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </DialogContent>
     </Dialog>
   );
