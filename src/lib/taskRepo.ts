@@ -12,7 +12,7 @@
 // sub-entidades), duplicação, dashboard e ações em massa. A orquestração e as
 // regras de negócio continuam no App (viram um TaskService na Fase 2).
 import { supabase } from './supabase';
-import { CustomFieldValue, Task, TaskPriority } from '../types';
+import { CustomFieldValue, Task, TaskPriority, TaskRecurrenceRule } from '../types';
 
 const PAGE_SIZE = 1000;
 export const INITIAL_TASK_PAGE_SIZE = 100;
@@ -951,6 +951,165 @@ export async function insertTaskClone(input: TaskCloneInput): Promise<{ task: Ta
       watcherIds: [],
     },
   };
+}
+
+// ── Regra de recorrência (issue #184, fase 3 — UI de configuração) ─────────
+// RLS já garante acesso (task_recurrence_rules_select/ins/upd/del usam
+// can_access_task/can_access_list, ver migration da fase 1) — sem
+// auto-referência na policy de SELECT, então .insert().select() é seguro
+// aqui (diferente de tasks/lists/folders, que precisaram de id-no-cliente).
+interface RecurrenceRuleRow {
+  id: string;
+  task_id: string;
+  list_id: string;
+  created_by: string | null;
+  enabled: boolean;
+  frequency_type: string;
+  interval: number;
+  weekdays: number[];
+  month_day: number | null;
+  month_week: number | null;
+  month_weekday: number | null;
+  start_at: string;
+  next_run_at: string | null;
+  timezone: string;
+  trigger_mode: string;
+  days_after_complete: number | null;
+  create_new_task: boolean;
+  skip_weekends: boolean;
+  skip_holidays: boolean;
+  weekend_shift: string;
+  end_mode: string;
+  end_at: string | null;
+  max_occurrences: number | null;
+  occurrences_created: number;
+  update_status_to: string | null;
+  inherit_options: Record<string, boolean>;
+  overlap_policy: string;
+  misfire_policy: string;
+  last_generated_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapRecurrenceRuleRow(r: RecurrenceRuleRow): TaskRecurrenceRule {
+  return {
+    id: r.id,
+    taskId: r.task_id,
+    listId: r.list_id,
+    createdBy: r.created_by ?? undefined,
+    enabled: r.enabled,
+    frequencyType: r.frequency_type as TaskRecurrenceRule['frequencyType'],
+    interval: r.interval,
+    weekdays: r.weekdays || [],
+    monthDay: r.month_day ?? undefined,
+    monthWeek: r.month_week ?? undefined,
+    monthWeekday: r.month_weekday ?? undefined,
+    startAt: r.start_at,
+    nextRunAt: r.next_run_at ?? undefined,
+    timezone: r.timezone,
+    triggerMode: r.trigger_mode as TaskRecurrenceRule['triggerMode'],
+    daysAfterComplete: r.days_after_complete ?? undefined,
+    createNewTask: r.create_new_task,
+    skipWeekends: r.skip_weekends,
+    skipHolidays: r.skip_holidays,
+    weekendShift: r.weekend_shift as TaskRecurrenceRule['weekendShift'],
+    endMode: r.end_mode as TaskRecurrenceRule['endMode'],
+    endAt: r.end_at ?? undefined,
+    maxOccurrences: r.max_occurrences ?? undefined,
+    occurrencesCreated: r.occurrences_created,
+    updateStatusTo: r.update_status_to ?? undefined,
+    inheritOptions: r.inherit_options || {},
+    overlapPolicy: r.overlap_policy as TaskRecurrenceRule['overlapPolicy'],
+    misfirePolicy: r.misfire_policy as TaskRecurrenceRule['misfirePolicy'],
+    lastGeneratedAt: r.last_generated_at ?? undefined,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+export async function fetchRecurrenceRuleForTask(taskId: string): Promise<TaskRecurrenceRule | null> {
+  const { data, error } = await supabase
+    .from('task_recurrence_rules')
+    .select('*')
+    .eq('task_id', taskId)
+    .maybeSingle();
+  if (error || !data) return null;
+  return mapRecurrenceRuleRow(data as RecurrenceRuleRow);
+}
+
+export interface RecurrenceRuleInput {
+  taskId: string;
+  listId: string;
+  createdBy: string;
+  frequencyType: TaskRecurrenceRule['frequencyType'];
+  interval: number;
+  weekdays: number[];
+  monthDay?: number | null;
+  monthWeek?: number | null;
+  monthWeekday?: number | null;
+  startAt: string;
+  nextRunAt: string | null;
+  timezone: string;
+  skipWeekends: boolean;
+  weekendShift: TaskRecurrenceRule['weekendShift'];
+  endMode: TaskRecurrenceRule['endMode'];
+  endAt?: string | null;
+  maxOccurrences?: number | null;
+  inheritOptions: TaskRecurrenceRule['inheritOptions'];
+  overlapPolicy: TaskRecurrenceRule['overlapPolicy'];
+  misfirePolicy: TaskRecurrenceRule['misfirePolicy'];
+}
+
+// Cria ou substitui a regra de recorrência da tarefa (uma tarefa tem no
+// máximo uma regra — upsert por task_id). Reseta occurrences_created/
+// last_generated_at ao recriar porque muda os parâmetros do zero.
+export async function upsertRecurrenceRule(
+  input: RecurrenceRuleInput,
+  existingRuleId: string | null,
+): Promise<{ rule: TaskRecurrenceRule } | { error: string }> {
+  const payload = {
+    task_id: input.taskId,
+    list_id: input.listId,
+    created_by: input.createdBy,
+    enabled: true,
+    frequency_type: input.frequencyType,
+    interval: input.interval,
+    weekdays: input.weekdays,
+    month_day: input.monthDay ?? null,
+    month_week: input.monthWeek ?? null,
+    month_weekday: input.monthWeekday ?? null,
+    start_at: input.startAt,
+    next_run_at: input.nextRunAt,
+    timezone: input.timezone,
+    trigger_mode: 'on_schedule',
+    skip_weekends: input.skipWeekends,
+    weekend_shift: input.weekendShift,
+    end_mode: input.endMode,
+    end_at: input.endAt ?? null,
+    max_occurrences: input.maxOccurrences ?? null,
+    inherit_options: input.inheritOptions,
+    overlap_policy: input.overlapPolicy,
+    misfire_policy: input.misfirePolicy,
+  };
+
+  const query = existingRuleId
+    ? supabase.from('task_recurrence_rules').update(payload).eq('id', existingRuleId)
+    : supabase.from('task_recurrence_rules').insert(payload);
+
+  const { data, error } = await query.select('*').single();
+  if (error || !data) return { error: error?.message ?? 'Falha ao salvar a regra de recorrência.' };
+  return { rule: mapRecurrenceRuleRow(data as RecurrenceRuleRow) };
+}
+
+export async function setRecurrenceRuleEnabled(ruleId: string, enabled: boolean): Promise<{ error: string | null }> {
+  const { error } = await supabase.from('task_recurrence_rules').update({ enabled }).eq('id', ruleId);
+  return { error: error?.message ?? null };
+}
+
+export async function deleteRecurrenceRule(ruleId: string): Promise<{ error: string | null }> {
+  const { error } = await supabase.from('task_recurrence_rules').delete().eq('id', ruleId);
+  return { error: error?.message ?? null };
 }
 
 // Copia os checklists de uma tarefa para outra. Devolve os itens já mapeados

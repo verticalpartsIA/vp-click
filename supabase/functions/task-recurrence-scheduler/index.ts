@@ -174,13 +174,18 @@ async function createOccurrenceTask(
     if (error.code === '23505') return { alreadyExists: true };
     return { error: error.message };
   }
-  await admin.from('task_activities').insert({
-    task_id: inserted.id,
-    user_id: rule.created_by,
-    action: 'TASK_RECURRENCE_GENERATED',
-    related_task_id: rule.task_id,
-    related_task_title: template.title,
-  });
+  // user_id é NOT NULL em task_activities — regra sem created_by (ex.: task
+  // de import legado, sem criador) não gera esse registro de atividade,
+  // mas isso não impede a criação da tarefa em si.
+  if (rule.created_by) {
+    await admin.from('task_activities').insert({
+      task_id: inserted.id,
+      user_id: rule.created_by,
+      type: 'TASK_RECURRENCE_GENERATED',
+      old_value: rule.task_id,
+      new_value: template.title,
+    });
+  }
   return { taskId: inserted.id };
 }
 

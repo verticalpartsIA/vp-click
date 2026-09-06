@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useNavigate, useLocation, useNavigationType, useSearchParams } from 'react-router-dom';
-import { MoreHorizontal, FileText, ListPlus, Link as LinkIcon, Image as ImageIcon, Paperclip, AlertTriangle as AlertTriangleIcon, Tag, Copy, ArrowUpDown, Search, Filter, RotateCcw, Check, X, Edit3, CalendarDays, UserCircle, Flag, MessageSquare, CheckSquare, GripVertical } from "lucide-react";
+import { MoreHorizontal, FileText, ListPlus, Link as LinkIcon, Image as ImageIcon, Paperclip, AlertTriangle as AlertTriangleIcon, Tag, Copy, ArrowUpDown, Search, Filter, RotateCcw, Check, X, Edit3, CalendarDays, UserCircle, Flag, MessageSquare, CheckSquare, GripVertical, Repeat, Pause, Play } from "lucide-react";
 import {
   User, Task, Workspace, Space, Folder, List, Project,
   UserRole, StatusType, StatusOption, StatusGroup, TaskPriority, ExtensionLog, Comment, ChecklistItem, Attachment,
-  CustomField, CustomFieldType, CustomFieldValue, CustomFieldOption, Doc, TaskActivity, WorkspaceTag, Team, AppNotification, DuplicateTaskOptions
+  CustomField, CustomFieldType, CustomFieldValue, CustomFieldOption, Doc, TaskActivity, WorkspaceTag, Team, AppNotification, DuplicateTaskOptions,
+  TaskRecurrenceRule, RecurrenceFrequencyType, RecurrenceWeekendShift, RecurrenceEndMode, RecurrenceOverlapPolicy, RecurrenceMisfirePolicy, RecurrenceInheritOptions
 } from './types';
 // import { MOCK_USERS, INITIAL_WORKSPACE, MOCK_SPACES, MOCK_FOLDERS, MOCK_LISTS, MOCK_TASKS, MOCK_PROJECTS, MOCK_CUSTOM_FIELDS, MOCK_CUSTOM_FIELD_VALUES } from './mockData';
 import { INITIAL_WORKSPACE, MOCK_PROJECTS } from './mockData'; // MOCK_PROJECTS temporário se ainda necessário
@@ -1585,6 +1586,16 @@ export default function App() {
   const [fieldManagerListIdOverride, setFieldManagerListIdOverride] = useState<string | null>(null);
   const [taskToDuplicate, setTaskToDuplicate] = useState<Task | null>(null);
   const [isDuplicatingTask, setIsDuplicatingTask] = useState(false);
+  // Issue #184 fase 3: configuração de recorrência. A regra é carregada sob
+  // demanda quando o modal abre (uma tarefa tem no máximo 1 regra).
+  const [recurrenceConfigTask, setRecurrenceConfigTask] = useState<Task | null>(null);
+  const [recurrenceConfigRule, setRecurrenceConfigRule] = useState<TaskRecurrenceRule | null>(null);
+  const [isLoadingRecurrenceRule, setIsLoadingRecurrenceRule] = useState(false);
+  const [isSavingRecurrenceRule, setIsSavingRecurrenceRule] = useState(false);
+  // Regras das tarefas atualmente visíveis (carregado sob demanda por
+  // openTaskRecurrenceModal e após mutações) — usado só pro indicador dentro
+  // do TaskDetailModal, não precisa cobrir toda a lista/kanban.
+  const [taskRecurrenceRuleCache, setTaskRecurrenceRuleCache] = useState<Record<string, TaskRecurrenceRule | null>>({});
 
   // New State for Creation Modals
   const [isSpaceModalOpen, setIsSpaceModalOpen] = useState(false);
@@ -1876,6 +1887,22 @@ export default function App() {
   // navegador) são tratadas pelo efeito de entrada logo após handleNavigate.
 
   const selectedTask = useMemo(() => tasks.find(t => t.id === selectedTaskId), [tasks, selectedTaskId]);
+
+  // Carrega a regra de recorrência da tarefa aberta (se houver) só pro
+  // indicador visual no TaskDetailModal — não bloqueia a UI, chave ausente no
+  // cache = "ainda não checou", null = "checou, não tem regra".
+  useEffect(() => {
+    if (!selectedTask) return;
+    let cancelled = false;
+    setTaskRecurrenceRuleCache((prev) => {
+      if (selectedTask.id in prev) return prev; // já checado — não refaz a busca
+      taskRepo.fetchRecurrenceRuleForTask(selectedTask.id).then((rule) => {
+        if (!cancelled) setTaskRecurrenceRuleCache((cur) => ({ ...cur, [selectedTask.id]: rule }));
+      });
+      return prev;
+    });
+    return () => { cancelled = true; };
+  }, [selectedTask]);
 
   // Qual comentário deixar rolado/destacado (e qual ação já deixar pronta —
   // responder ou resolver) quando a tarefa é aberta a partir de uma
@@ -3248,6 +3275,72 @@ export default function App() {
     }
   };
 
+  // Issue #184 fase 3: abre o modal de recorrência buscando a regra atual da
+  // tarefa (null se ainda não tem uma configurada — o modal nasce em modo
+  // "criar" nesse caso).
+  const openTaskRecurrenceModal = async (task: Task) => {
+    setRecurrenceConfigTask(task);
+    setIsLoadingRecurrenceRule(true);
+    try {
+      const rule = await taskRepo.fetchRecurrenceRuleForTask(task.id);
+      setRecurrenceConfigRule(rule);
+      setTaskRecurrenceRuleCache((prev) => ({ ...prev, [task.id]: rule }));
+    } finally {
+      setIsLoadingRecurrenceRule(false);
+    }
+  };
+
+  const handleSaveRecurrenceRule = async (input: Omit<taskRepo.RecurrenceRuleInput, 'taskId' | 'listId' | 'createdBy'>) => {
+    if (!recurrenceConfigTask || isSavingRecurrenceRule) return;
+    setIsSavingRecurrenceRule(true);
+    try {
+      const res = await taskRepo.upsertRecurrenceRule(
+        {
+          ...input,
+          taskId: recurrenceConfigTask.id,
+          listId: recurrenceConfigTask.listId as string,
+          createdBy: currentUser.id,
+        },
+        recurrenceConfigRule?.id ?? null,
+      );
+      if ('error' in res) throw new Error(res.error);
+      setTaskRecurrenceRuleCache((prev) => ({ ...prev, [recurrenceConfigTask.id]: res.rule }));
+      setRecurrenceConfigTask(null);
+      setRecurrenceConfigRule(null);
+      toast.success('Recorrência configurada com sucesso.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error('Erro ao salvar recorrência: ' + message);
+    } finally {
+      setIsSavingRecurrenceRule(false);
+    }
+  };
+
+  const handleToggleRecurrenceEnabled = async (rule: TaskRecurrenceRule, enabled: boolean) => {
+    const { error } = await taskRepo.setRecurrenceRuleEnabled(rule.id, enabled);
+    if (error) {
+      toast.error('Erro ao ' + (enabled ? 'retomar' : 'pausar') + ' recorrência: ' + error);
+      return;
+    }
+    const updated = { ...rule, enabled };
+    setTaskRecurrenceRuleCache((prev) => ({ ...prev, [rule.taskId]: updated }));
+    if (recurrenceConfigRule?.id === rule.id) setRecurrenceConfigRule(updated);
+    toast.success(enabled ? 'Recorrência retomada.' : 'Recorrência pausada.');
+  };
+
+  const handleDeleteRecurrenceRule = async (rule: TaskRecurrenceRule) => {
+    if (!window.confirm('Excluir a configuração de recorrência desta tarefa? As ocorrências já criadas não são apagadas.')) return;
+    const { error } = await taskRepo.deleteRecurrenceRule(rule.id);
+    if (error) {
+      toast.error('Erro ao excluir recorrência: ' + error);
+      return;
+    }
+    setTaskRecurrenceRuleCache((prev) => ({ ...prev, [rule.taskId]: null }));
+    setRecurrenceConfigTask(null);
+    setRecurrenceConfigRule(null);
+    toast.success('Recorrência removida.');
+  };
+
   const openFolderModal = (spaceId: string) => {
     setTargetSpaceId(spaceId);
     setIsFolderModalOpen(true);
@@ -4274,6 +4367,8 @@ export default function App() {
               }}
               onDelete={() => handleDeleteTask(selectedTask.id)}
               onDuplicate={() => setTaskToDuplicate(selectedTask)}
+              onConfigureRecurrence={() => openTaskRecurrenceModal(selectedTask)}
+              recurrenceRule={taskRecurrenceRuleCache[selectedTask.id]}
               onSelectTask={setSelectedTaskId}
               onQuickCreate={(prefill?: any) => {
                 setPrefilledTaskData(prefill || null);
@@ -4343,6 +4438,20 @@ export default function App() {
           onDuplicate={(options) => {
             if (taskToDuplicate) handleDuplicateTask(taskToDuplicate, options);
           }}
+        />
+
+        <RecurrenceConfigModal
+          task={recurrenceConfigTask}
+          rule={recurrenceConfigRule}
+          isOpen={!!recurrenceConfigTask}
+          isLoading={isLoadingRecurrenceRule}
+          isSubmitting={isSavingRecurrenceRule}
+          onClose={() => {
+            if (!isSavingRecurrenceRule) { setRecurrenceConfigTask(null); setRecurrenceConfigRule(null); }
+          }}
+          onSave={handleSaveRecurrenceRule}
+          onToggleEnabled={handleToggleRecurrenceEnabled}
+          onDelete={handleDeleteRecurrenceRule}
         />
 
         {/* Custom Fields Manager */}
@@ -6490,6 +6599,422 @@ function DuplicateTaskModal({
   );
 }
 
+const WEEKDAY_LABELS = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+const NTH_WEEK_LABELS: Record<number, string> = { 1: '1ª', 2: '2ª', 3: '3ª', 4: '4ª', 5: 'última' };
+
+// Converte um Date pra valor de <input type="datetime-local"> no fuso local
+// do navegador (não usa toISOString — isso converteria pra UTC e descolaria
+// a hora exibida da hora que o usuário quis dizer).
+function toDatetimeLocalValue(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+interface RecurrenceFormState {
+  frequencyType: RecurrenceFrequencyType;
+  interval: number;
+  weekdays: number[];
+  monthMode: 'day' | 'nth';
+  monthDay: number;
+  monthWeek: number;
+  monthWeekday: number;
+  startAt: string; // valor de datetime-local
+  skipWeekends: boolean;
+  weekendShift: RecurrenceWeekendShift;
+  endMode: RecurrenceEndMode;
+  endAt: string; // valor de date
+  maxOccurrences: number;
+  inheritOptions: RecurrenceInheritOptions;
+  overlapPolicy: RecurrenceOverlapPolicy;
+  misfirePolicy: RecurrenceMisfirePolicy;
+}
+
+function defaultRecurrenceForm(task: Task | null): RecurrenceFormState {
+  const now = new Date();
+  now.setMinutes(0, 0, 0);
+  now.setHours(now.getHours() + 1);
+  return {
+    frequencyType: 'weekly',
+    interval: 1,
+    weekdays: task ? [now.getDay()] : [1],
+    monthMode: 'day',
+    monthDay: now.getDate(),
+    monthWeek: 1,
+    monthWeekday: 1,
+    startAt: toDatetimeLocalValue(now),
+    skipWeekends: false,
+    weekendShift: 'next_business_day',
+    endMode: 'forever',
+    endAt: '',
+    maxOccurrences: 10,
+    inheritOptions: { includeDescription: true, includePriority: true, includeAssignees: true, includeTags: true },
+    overlapPolicy: 'create_and_flag',
+    misfirePolicy: 'create_latest_only',
+  };
+}
+
+function ruleToRecurrenceForm(rule: TaskRecurrenceRule): RecurrenceFormState {
+  return {
+    frequencyType: rule.frequencyType,
+    interval: rule.interval,
+    weekdays: rule.weekdays.length > 0 ? rule.weekdays : [1],
+    monthMode: rule.monthWeek != null && rule.monthWeekday != null ? 'nth' : 'day',
+    monthDay: rule.monthDay ?? new Date(rule.startAt).getDate(),
+    monthWeek: rule.monthWeek ?? 1,
+    monthWeekday: rule.monthWeekday ?? 1,
+    startAt: toDatetimeLocalValue(new Date(rule.startAt)),
+    skipWeekends: rule.skipWeekends,
+    weekendShift: rule.weekendShift,
+    endMode: rule.endMode,
+    endAt: rule.endAt ? rule.endAt.slice(0, 10) : '',
+    maxOccurrences: rule.maxOccurrences ?? 10,
+    inheritOptions: rule.inheritOptions,
+    overlapPolicy: rule.overlapPolicy,
+    misfirePolicy: rule.misfirePolicy,
+  };
+}
+
+// Modal de configuração de recorrência (issue #184, fase 3). Cria ou edita a
+// ÚNICA regra da tarefa — o motor de cálculo e o scheduler (pg_cron + Edge
+// Function task-recurrence-scheduler) já rodam em produção desde a fase 2;
+// este modal só monta o RecurrenceRuleInput que o backend consome.
+function RecurrenceConfigModal({
+  task,
+  rule,
+  isOpen,
+  isLoading,
+  isSubmitting,
+  onClose,
+  onSave,
+  onToggleEnabled,
+  onDelete,
+}: {
+  task: Task | null;
+  rule: TaskRecurrenceRule | null;
+  isOpen: boolean;
+  isLoading: boolean;
+  isSubmitting: boolean;
+  onClose: () => void;
+  onSave: (input: Omit<import('./lib/taskRepo').RecurrenceRuleInput, 'taskId' | 'listId' | 'createdBy'>) => void;
+  onToggleEnabled: (rule: TaskRecurrenceRule, enabled: boolean) => void;
+  onDelete: (rule: TaskRecurrenceRule) => void;
+}) {
+  const [form, setForm] = useState<RecurrenceFormState>(() => defaultRecurrenceForm(task));
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setForm(rule ? ruleToRecurrenceForm(rule) : defaultRecurrenceForm(task));
+  }, [isOpen, rule, task]);
+
+  const toggleWeekday = (day: number) => {
+    setForm((prev) => ({
+      ...prev,
+      weekdays: prev.weekdays.includes(day) ? prev.weekdays.filter((d) => d !== day) : [...prev.weekdays, day].sort(),
+    }));
+  };
+
+  const toggleInherit = (key: keyof RecurrenceInheritOptions, value: boolean) => {
+    setForm((prev) => ({ ...prev, inheritOptions: { ...prev.inheritOptions, [key]: value } }));
+  };
+
+  const handleSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (isSubmitting) return;
+    const startAtDate = new Date(form.startAt);
+    if (Number.isNaN(startAtDate.getTime())) {
+      toast.error('Informe uma data/hora de início válida.');
+      return;
+    }
+    if (form.frequencyType === 'weekly' && form.weekdays.length === 0) {
+      toast.error('Selecione ao menos um dia da semana.');
+      return;
+    }
+
+    onSave({
+      frequencyType: form.frequencyType,
+      interval: Math.max(1, form.interval),
+      weekdays: form.frequencyType === 'weekly' ? form.weekdays : [],
+      monthDay: form.frequencyType === 'monthly' && form.monthMode === 'day' ? form.monthDay : null,
+      monthWeek: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeek : null,
+      monthWeekday: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeekday : null,
+      startAt: startAtDate.toISOString(),
+      // A primeira ocorrência gerada é exatamente o start_at — o scheduler
+      // avança a partir daí a cada execução (ver task-recurrence-scheduler).
+      nextRunAt: startAtDate.toISOString(),
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo',
+      skipWeekends: form.skipWeekends,
+      weekendShift: form.weekendShift,
+      endMode: form.endMode,
+      endAt: form.endMode === 'until' && form.endAt ? new Date(`${form.endAt}T23:59:59`).toISOString() : null,
+      maxOccurrences: form.endMode === 'count' ? Math.max(1, form.maxOccurrences) : null,
+      inheritOptions: form.inheritOptions,
+      overlapPolicy: form.overlapPolicy,
+      misfirePolicy: form.misfirePolicy,
+    });
+  };
+
+  const inheritItems: Array<{ key: keyof RecurrenceInheritOptions; label: string }> = [
+    { key: 'includeDescription', label: 'Descrição' },
+    { key: 'includePriority', label: 'Prioridade' },
+    { key: 'includeAssignees', label: 'Responsáveis' },
+    { key: 'includeTags', label: 'Etiquetas' },
+  ];
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="max-w-2xl p-0 overflow-hidden max-h-[85vh] flex flex-col">
+        <form onSubmit={handleSubmit} className="flex flex-col overflow-hidden">
+          <DialogHeader className="px-6 pt-6 pb-4 border-b bg-gray-50/60 shrink-0">
+            <DialogTitle className="flex items-center gap-2 text-xl">
+              <Repeat className="w-5 h-5 text-blue-500" />
+              {rule ? 'Editar recorrência' : 'Configurar recorrência'}
+            </DialogTitle>
+            <DialogDescription>
+              Uma nova ocorrência desta tarefa é criada automaticamente conforme a frequência abaixo.
+            </DialogDescription>
+          </DialogHeader>
+
+          {isLoading ? (
+            <div className="p-8 text-center text-sm text-gray-400">Carregando...</div>
+          ) : (
+            <div className="p-6 space-y-5 overflow-y-auto">
+              {rule && (
+                <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-600">
+                  <span>
+                    {rule.enabled ? 'Ativa' : 'Pausada'} · {rule.occurrencesCreated} ocorrência{rule.occurrencesCreated === 1 ? '' : 's'} criada{rule.occurrencesCreated === 1 ? '' : 's'}
+                    {rule.nextRunAt && rule.enabled && ` · próxima em ${new Date(rule.nextRunAt).toLocaleString('pt-BR')}`}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onToggleEnabled(rule, !rule.enabled)}
+                    className="flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2 py-1 font-semibold text-gray-600 hover:bg-gray-100"
+                  >
+                    {rule.enabled ? <><Pause className="w-3 h-3" /> Pausar</> : <><Play className="w-3 h-3" /> Retomar</>}
+                  </button>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">Frequência</label>
+                  <select
+                    value={form.frequencyType}
+                    onChange={(e) => setForm((prev) => ({ ...prev, frequencyType: e.target.value as RecurrenceFrequencyType }))}
+                    className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="daily">Diária</option>
+                    <option value="weekly">Semanal</option>
+                    <option value="monthly">Mensal</option>
+                    <option value="yearly">Anual</option>
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">A cada</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      value={form.interval}
+                      onChange={(e) => setForm((prev) => ({ ...prev, interval: Number(e.target.value) || 1 }))}
+                      className="w-20 rounded-xl border border-gray-200 bg-white px-3 py-3 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                    />
+                    <span className="text-sm text-gray-500">
+                      {{ daily: 'dia(s)', weekly: 'semana(s)', monthly: 'mês(es)', yearly: 'ano(s)', custom: 'período(s)' }[form.frequencyType]}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {form.frequencyType === 'weekly' && (
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">Dias da semana</label>
+                  <div className="flex gap-1.5">
+                    {WEEKDAY_LABELS.map((label, day) => (
+                      <button
+                        key={day}
+                        type="button"
+                        onClick={() => toggleWeekday(day)}
+                        className={`w-10 h-10 rounded-lg text-xs font-bold transition-colors ${form.weekdays.includes(day) ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {form.frequencyType === 'monthly' && (
+                <div className="space-y-2">
+                  <div className="flex gap-4 text-sm">
+                    <label className="flex items-center gap-2">
+                      <input type="radio" checked={form.monthMode === 'day'} onChange={() => setForm((prev) => ({ ...prev, monthMode: 'day' }))} />
+                      Dia fixo do mês
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input type="radio" checked={form.monthMode === 'nth'} onChange={() => setForm((prev) => ({ ...prev, monthMode: 'nth' }))} />
+                      Em um dia específico
+                    </label>
+                  </div>
+                  {form.monthMode === 'day' ? (
+                    <input
+                      type="number"
+                      min={1}
+                      max={31}
+                      value={form.monthDay}
+                      onChange={(e) => setForm((prev) => ({ ...prev, monthDay: Number(e.target.value) || 1 }))}
+                      className="w-24 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                    />
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={form.monthWeek}
+                        onChange={(e) => setForm((prev) => ({ ...prev, monthWeek: Number(e.target.value) }))}
+                        className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                      >
+                        {[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{NTH_WEEK_LABELS[n]}</option>)}
+                      </select>
+                      <select
+                        value={form.monthWeekday}
+                        onChange={(e) => setForm((prev) => ({ ...prev, monthWeekday: Number(e.target.value) }))}
+                        className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                      >
+                        {WEEKDAY_LABELS.map((label, day) => <option key={day} value={day}>{label}-feira</option>)}
+                      </select>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-gray-700">Início da primeira ocorrência</label>
+                <input
+                  type="datetime-local"
+                  value={form.startAt}
+                  onChange={(e) => setForm((prev) => ({ ...prev, startAt: e.target.value }))}
+                  className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+                  <Checkbox checked={form.skipWeekends} onCheckedChange={(c) => setForm((prev) => ({ ...prev, skipWeekends: c === true }))} />
+                  Pular fins de semana
+                </label>
+                {form.skipWeekends && (
+                  <select
+                    value={form.weekendShift}
+                    onChange={(e) => setForm((prev) => ({ ...prev, weekendShift: e.target.value as RecurrenceWeekendShift }))}
+                    className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="next_business_day">Mover para o próximo dia útil</option>
+                    <option value="previous_business_day">Mover para o dia útil anterior</option>
+                    <option value="skip">Pular esta ocorrência</option>
+                  </select>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-gray-700">Encerramento</label>
+                <div className="flex gap-4 text-sm mb-2">
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={form.endMode === 'forever'} onChange={() => setForm((prev) => ({ ...prev, endMode: 'forever' }))} /> Nunca</label>
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={form.endMode === 'count'} onChange={() => setForm((prev) => ({ ...prev, endMode: 'count' }))} /> Após N vezes</label>
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={form.endMode === 'until'} onChange={() => setForm((prev) => ({ ...prev, endMode: 'until' }))} /> Até uma data</label>
+                </div>
+                {form.endMode === 'count' && (
+                  <input
+                    type="number"
+                    min={1}
+                    value={form.maxOccurrences}
+                    onChange={(e) => setForm((prev) => ({ ...prev, maxOccurrences: Number(e.target.value) || 1 }))}
+                    className="w-24 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  />
+                )}
+                {form.endMode === 'until' && (
+                  <input
+                    type="date"
+                    value={form.endAt}
+                    onChange={(e) => setForm((prev) => ({ ...prev, endAt: e.target.value }))}
+                    className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  />
+                )}
+              </div>
+
+              <div>
+                <p className="text-sm font-semibold text-gray-700 mb-2">O que herdar na nova ocorrência</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {inheritItems.map((item) => (
+                    <label key={item.key} className="flex items-center gap-2 rounded-xl border border-gray-200 bg-white p-2.5 hover:border-blue-200 cursor-pointer">
+                      <Checkbox checked={Boolean(form.inheritOptions[item.key])} onCheckedChange={(c) => toggleInherit(item.key, c === true)} />
+                      <span className="text-sm text-gray-700">{item.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">Se a anterior ainda está aberta</label>
+                  <select
+                    value={form.overlapPolicy}
+                    onChange={(e) => setForm((prev) => ({ ...prev, overlapPolicy: e.target.value as RecurrenceOverlapPolicy }))}
+                    className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="create_anyway">Criar normalmente</option>
+                    <option value="create_and_flag">Criar e sinalizar</option>
+                    <option value="escalate">Criar e notificar</option>
+                    <option value="skip_new">Pular esta ocorrência</option>
+                    <option value="postpone">Esperar a anterior fechar</option>
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">Se o sistema ficou parado</label>
+                  <select
+                    value={form.misfirePolicy}
+                    onChange={(e) => setForm((prev) => ({ ...prev, misfirePolicy: e.target.value as RecurrenceMisfirePolicy }))}
+                    className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="skip_past">Pular ocorrências atrasadas</option>
+                    <option value="create_latest_only">Criar só a mais recente</option>
+                    <option value="create_all_up_to_limit">Criar todas as atrasadas</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <DialogFooter className="px-6 py-4 border-t bg-gray-50/80 shrink-0">
+            {rule && (
+              <button
+                type="button"
+                onClick={() => onDelete(rule)}
+                disabled={isSubmitting}
+                className="mr-auto px-4 py-2 rounded-lg border border-red-200 bg-white text-sm font-semibold text-red-500 hover:bg-red-50 disabled:opacity-50"
+              >
+                Excluir recorrência
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={isSubmitting}
+              className="px-4 py-2 rounded-lg border border-gray-200 bg-white text-sm font-semibold text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={isSubmitting || isLoading}
+              className="px-5 py-2 rounded-lg bg-[var(--primary-color)] text-[#2c3e50] text-sm font-black hover:brightness-95 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isSubmitting ? 'Salvando...' : rule ? 'Salvar alterações' : 'Ativar recorrência'}
+            </button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 // Datas de tarefa (dueDate/startDate) são strings "YYYY-MM-DD" (sem hora).
 // `new Date("YYYY-MM-DD")` interpreta isso como meia-noite UTC, que em fusos
 // atrás de UTC (ex: Brasil) cai no dia anterior ao formatar/comparar em
@@ -7926,6 +8451,11 @@ function KanbanView({ tasks, onSelectTask, onStatusChange, onQuickUpdateTask, on
                                 <AlertTriangleIcon className="h-3 w-3 text-amber-400" />
                               </span>
                             )}
+                            {task.recurrenceRuleId && (
+                              <span title="Ocorrência de tarefa recorrente" className="mt-0.5 shrink-0">
+                                <Repeat className="h-3 w-3 text-blue-400" />
+                              </span>
+                            )}
                             {task.title}
                           </p>
 
@@ -8952,6 +9482,8 @@ function TaskDetailModal(props: any) {
     hiddenTaskFieldIdsByList,
     onDelete,
     onDuplicate,
+    onConfigureRecurrence,
+    recurrenceRule,
     tasks,
     onSelectTask,
     onQuickCreate,
@@ -9518,6 +10050,24 @@ function TaskDetailModal(props: any) {
               >
                 <Copy className="w-4 h-4" /> Duplicar
               </button>
+            )}
+            {task.recurrenceRuleId ? (
+              <span
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-50 text-blue-600 text-xs font-semibold"
+                title="Esta tarefa foi gerada automaticamente por uma regra de recorrência"
+              >
+                <Repeat className="w-3.5 h-3.5" /> Ocorrência recorrente
+              </span>
+            ) : (
+              !isReadOnly && onConfigureRecurrence && (
+                <button
+                  onClick={onConfigureRecurrence}
+                  className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded-lg transition-all ${recurrenceRule ? (recurrenceRule.enabled ? 'bg-blue-50 text-blue-600' : 'bg-gray-100 text-gray-500') : 'hover:bg-blue-50 text-gray-500 hover:text-blue-600'}`}
+                  title="Configurar recorrência"
+                >
+                  <Repeat className="w-4 h-4" /> {recurrenceRule ? (recurrenceRule.enabled ? 'Recorrente' : 'Recorrência pausada') : 'Recorrência'}
+                </button>
+              )
             )}
             {!isReadOnly && onDelete && (
               <button onClick={onDelete} className="p-2 hover:bg-red-50 text-red-400 rounded-lg transition-colors" title="Excluir Tarefa">
@@ -10192,7 +10742,9 @@ function TaskDetailModal(props: any) {
                       'MAIN_RESPONSIBLE_CHANGE': 'bg-purple-50/30 border-purple-50 text-purple-600 circle-purple-400',
                       'RESPONSIBLE_ADDED': 'bg-green-50/30 border-green-50 text-green-600 circle-green-400',
                       'RESPONSIBLE_REMOVED': 'bg-red-50/30 border-red-50 text-red-600 circle-red-400',
-                      'TEAM_ASSIGNED': 'bg-purple-50/30 border-purple-50 text-purple-600 circle-purple-400'
+                      'TEAM_ASSIGNED': 'bg-purple-50/30 border-purple-50 text-purple-600 circle-purple-400',
+                      'TASK_DUPLICATED': 'bg-indigo-50/30 border-indigo-50 text-indigo-600 circle-indigo-400',
+                      'TASK_RECURRENCE_GENERATED': 'bg-indigo-50/30 border-indigo-50 text-indigo-600 circle-indigo-400'
                     };
 
                     const style = typeStyles[item.type] || 'bg-gray-50/30 border-gray-50 text-gray-600 circle-gray-400';
@@ -10203,10 +10755,16 @@ function TaskDetailModal(props: any) {
                         <div className={`absolute -left-[22px] top-1.5 w-2 h-2 rounded-full border-2 border-white shadow-sm ${circleClass.replace('circle-', 'bg-')}`}></div>
                         <div className={`text-xs leading-relaxed ${bgClass} p-3 rounded-2xl ml-2 border ${borderClass} shadow-sm transition-all hover:shadow-md`}>
                           <div className="flex items-center justify-between mb-1">
-                            <span className="font-bold text-gray-900">{users.find((u: any) => u.id === item.userId)?.name}</span>
+                            <span className="font-bold text-gray-900">{users.find((u: any) => u.id === item.userId)?.name || 'Recorrência automática'}</span>
                             <span className="text-[10px] text-gray-300">{formatDate(item.date)}</span>
                           </div>
                           <p className="text-gray-600 mt-1">
+                            {item.type === 'TASK_DUPLICATED' && (
+                              <>duplicou esta tarefa a partir de <span className={`font-bold ${textAccentClass}`}>{item.newValue}</span></>
+                            )}
+                            {item.type === 'TASK_RECURRENCE_GENERATED' && (
+                              <>tarefa gerada automaticamente pela recorrência de <span className={`font-bold ${textAccentClass}`}>{item.newValue}</span></>
+                            )}
                             {item.type === 'STATUS_CHANGE' && (
                               <>alterou o status para <span className={`font-bold ${textAccentClass}`}>{item.newValue}</span></>
                             )}
