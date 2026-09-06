@@ -16,6 +16,7 @@ import CreateListModal from './components/CreateListModal';
 import compactLogoWhite from './assets/logo-verticalparts-white.png';
 import bootLogoVideo from './assets/logo-limpo-video.mp4';
 import { recordRecentTaskId } from './lib/recentTasks';
+import { buildSlugIndex, type SlugIndex } from './lib/slug';
 import { lazyImportWithReload, clearChunkReloadFlag } from './lib/lazyRetry';
 import { supabase } from './lib/supabase';
 import * as taskRepo from './lib/taskRepo';
@@ -179,34 +180,105 @@ interface ParsedNav {
   listId: string | null;
   scopeType: ScopeType;
   scopeId: string | null;
+  scopeName: string;
   mine: boolean;
   taskId: string | null;
 }
 
+// Índices slug<->id de espaços/pastas/listas, usados por parseNavPath (URL →
+// estado) e computeNavPath (estado → URL) pra trocar `?scope=space&scopeId=
+// <uuid>` por um path legível (`/suprimentos/importacao`). Ficam vazios até
+// os dados carregarem (ver `workspaceMetaLoaded`) — nesse meio-tempo qualquer
+// path de escopo cai no fallback global/Dashboard e é corrigido assim que os
+// índices ficarem prontos (ver efeito de entrada mais abaixo).
+interface NavSlugMaps {
+  spaces: Pick<Space, 'id' | 'name'>[];
+  folders: Pick<Folder, 'id' | 'name' | 'spaceId'>[];
+  lists: Pick<List, 'id' | 'name' | 'folderId'>[];
+  spaceIndex: SlugIndex;
+  folderIndex: SlugIndex;
+  listIndex: SlugIndex;
+}
+
 // URL → estado de navegação. Usada tanto na carga inicial (deep link/refresh)
 // quanto quando o usuário navega pelo botão voltar/avançar do navegador.
-function parseNavPath(pathname: string, search: string): ParsedNav {
+function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): ParsedNav {
   const segments = pathname.split('/').filter(Boolean);
   const params = new URLSearchParams(search);
   const taskId = params.get('taskId');
   if (segments[0] === 'doc') {
-    return { view: 'Doc', docId: segments[1] || null, listId: null, scopeType: 'global', scopeId: null, mine: false, taskId };
+    return { view: 'Doc', docId: segments[1] || null, listId: null, scopeType: 'global', scopeId: null, scopeName: '', mine: false, taskId };
   }
-  const view = SLUG_TO_VIEW[segments[0] || ''] || 'Dashboard';
-  const listId = params.get('listId');
-  const scopeParam = params.get('scope');
-  const scopeId = params.get('scopeId');
-  const mine = params.get('mine') === '1';
-  const scopeType: ScopeType = (scopeParam === 'space' || scopeParam === 'folder') && scopeId ? scopeParam : 'global';
-  return {
-    view,
-    docId: null,
-    listId: WORKSPACE_VIEWS.includes(view) ? listId : null,
-    scopeType,
-    scopeId: scopeType === 'global' ? null : scopeId,
-    mine: WORKSPACE_VIEWS.includes(view) && mine,
-    taskId,
-  };
+
+  // Primeiro segmento bate com uma view conhecida (ou path vazio = raiz) →
+  // navegação "global" de sempre: view no path, escopo (se houver) em query
+  // params legados (?scope=&scopeId=, ?listId=) — mantém links antigos
+  // funcionando, o efeito de saída já reescreve pro formato novo em seguida.
+  if (segments[0] === undefined || segments[0] in SLUG_TO_VIEW) {
+    const view = SLUG_TO_VIEW[segments[0] || ''] || 'Dashboard';
+    const listId = params.get('listId');
+    const scopeParam = params.get('scope');
+    const scopeId = params.get('scopeId');
+    const mine = params.get('mine') === '1';
+    const scopeType: ScopeType = (scopeParam === 'space' || scopeParam === 'folder') && scopeId ? scopeParam : 'global';
+    const scopeName = scopeType === 'space'
+      ? slugMaps.spaces.find(s => s.id === scopeId)?.name ?? ''
+      : scopeType === 'folder'
+        ? slugMaps.folders.find(f => f.id === scopeId)?.name ?? ''
+        : mine ? 'Minhas Tarefas' : 'Dashboard';
+    return {
+      view,
+      docId: null,
+      listId: WORKSPACE_VIEWS.includes(view) ? listId : null,
+      scopeType,
+      scopeId: scopeType === 'global' ? null : scopeId,
+      scopeName,
+      mine: WORKSPACE_VIEWS.includes(view) && mine,
+      taskId,
+    };
+  }
+
+  // Primeiro segmento não é view conhecida → candidato a slug de espaço
+  // (/<space>[/<folder>[/<list>]]). Se não resolver (slug inválido OU
+  // índices ainda vazios porque os dados não carregaram), cai no fallback
+  // Dashboard/global — o efeito de entrada re-tenta assim que os índices
+  // ficarem prontos.
+  const spaceId = slugMaps.spaceIndex.slugToId.get(` ${segments[0]}`);
+  const space = spaceId ? slugMaps.spaces.find(s => s.id === spaceId) : undefined;
+  if (!space) {
+    return { view: 'Dashboard', docId: null, listId: null, scopeType: 'global', scopeId: null, scopeName: 'Dashboard', mine: false, taskId };
+  }
+
+  let folderId: string | null = null;
+  let folderName = '';
+  if (segments[1]) {
+    const resolvedFolderId = slugMaps.folderIndex.slugToId.get(`${space.id} ${segments[1]}`);
+    const folder = resolvedFolderId ? slugMaps.folders.find(f => f.id === resolvedFolderId) : undefined;
+    if (folder) {
+      folderId = folder.id;
+      folderName = folder.name;
+    }
+  }
+
+  let listId: string | null = null;
+  if (folderId && segments[2]) {
+    const resolvedListId = slugMaps.listIndex.slugToId.get(`${folderId} ${segments[2]}`);
+    if (resolvedListId && slugMaps.lists.some(l => l.id === resolvedListId)) {
+      listId = resolvedListId;
+    }
+  }
+
+  // Dashboard (Overview) só existe pra escopo de ESPAÇO (SpaceOverview) — não
+  // há um "FolderOverview". O próprio handleNavigate já força `List` ao
+  // navegar pra pasta/lista pelo clique da sidebar; replicamos a mesma regra
+  // aqui pro default de uma URL sem `?view=` explícito, senão pasta/lista sem
+  // view na URL cai no Dashboard GLOBAL (sem filtro de escopo) por engano.
+  const viewParam = params.get('view');
+  const view = (viewParam && SLUG_TO_VIEW[viewParam]) || (folderId ? 'List' : 'Dashboard');
+  const scopeType: ScopeType = listId ? 'global' : folderId ? 'folder' : 'space';
+  const scopeId = listId ? null : folderId ?? space.id;
+  const scopeName = listId ? '' : folderId ? folderName : space.name;
+  return { view, docId: null, listId, scopeType, scopeId, scopeName, mine: false, taskId };
 }
 
 // Estado de navegação → URL. `currentSearch` carrega params que não são de
@@ -215,12 +287,14 @@ function parseNavPath(pathname: string, search: string): ParsedNav {
 function computeNavPath(
   state: { activeView: ActiveView; activeListId: string | null; activeScope: NavigationScope; activeDocId: string | null; selectedTaskId: string | null },
   currentSearch: string,
+  slugMaps: NavSlugMaps,
 ): string {
   const params = new URLSearchParams(currentSearch);
   params.delete('listId');
   params.delete('scope');
   params.delete('scopeId');
   params.delete('mine');
+  params.delete('view');
 
   if (state.selectedTaskId) {
     params.set('taskId', state.selectedTaskId);
@@ -242,19 +316,63 @@ function computeNavPath(
     return `/doc${state.activeDocId ? `/${state.activeDocId}` : ''}${search ? `?${search}` : ''}`;
   }
 
-  const slug = VIEW_TO_SLUG[state.activeView] ?? '';
-  if (WORKSPACE_VIEWS.includes(state.activeView)) {
-    if (state.activeListId) {
-      params.set('listId', state.activeListId);
-    } else if (state.activeScope.type === 'space' && state.activeScope.id) {
-      params.set('scope', 'space');
-      params.set('scopeId', state.activeScope.id);
-    } else if (state.activeScope.type === 'folder' && state.activeScope.id) {
-      params.set('scope', 'folder');
-      params.set('scopeId', state.activeScope.id);
-    } else if (state.activeScope.name === 'Minhas Tarefas') {
-      params.set('mine', '1');
+  if (!WORKSPACE_VIEWS.includes(state.activeView)) {
+    const slug = VIEW_TO_SLUG[state.activeView] ?? '';
+    const search = params.toString();
+    return `${slug ? `/${slug}` : '/'}${search ? `?${search}` : ''}`;
+  }
+
+  // Tenta montar o path legível (/<space>[/<folder>[/<list>]]). Sem espaço
+  // resolvido (escopo global, ou "Minhas Tarefas", ou dados ainda não
+  // carregados), cai pro esquema antigo (view no path, escopo em query).
+  let spaceId: string | null = null;
+  let folderId: string | null = null;
+  if (state.activeListId) {
+    const list = slugMaps.lists.find(l => l.id === state.activeListId);
+    const folder = list ? slugMaps.folders.find(f => f.id === list.folderId) : undefined;
+    if (list && folder) {
+      folderId = folder.id;
+      spaceId = folder.spaceId;
     }
+  } else if (state.activeScope.type === 'folder' && state.activeScope.id) {
+    const folder = slugMaps.folders.find(f => f.id === state.activeScope.id);
+    if (folder) {
+      folderId = folder.id;
+      spaceId = folder.spaceId;
+    }
+  } else if (state.activeScope.type === 'space' && state.activeScope.id) {
+    spaceId = state.activeScope.id;
+  }
+
+  const spaceSlug = spaceId ? slugMaps.spaceIndex.idToSlug.get(spaceId) : undefined;
+  if (spaceSlug) {
+    const pathParts = [spaceSlug];
+    const folderSlug = folderId ? slugMaps.folderIndex.idToSlug.get(folderId) : undefined;
+    if (folderSlug) {
+      pathParts.push(folderSlug);
+      const listSlug = state.activeListId ? slugMaps.listIndex.idToSlug.get(state.activeListId) : undefined;
+      if (listSlug) pathParts.push(listSlug);
+    }
+    if (state.activeView !== 'Dashboard') {
+      params.set('view', VIEW_TO_SLUG[state.activeView] ?? '');
+    }
+    const search = params.toString();
+    return `/${pathParts.join('/')}${search ? `?${search}` : ''}`;
+  }
+
+  // Fallback legado: escopo ainda não resolvível em slug (índices vazios,
+  // ou é "Minhas Tarefas"/global) — mantém o comportamento anterior.
+  const slug = VIEW_TO_SLUG[state.activeView] ?? '';
+  if (state.activeListId) {
+    params.set('listId', state.activeListId);
+  } else if (state.activeScope.type === 'space' && state.activeScope.id) {
+    params.set('scope', 'space');
+    params.set('scopeId', state.activeScope.id);
+  } else if (state.activeScope.type === 'folder' && state.activeScope.id) {
+    params.set('scope', 'folder');
+    params.set('scopeId', state.activeScope.id);
+  } else if (state.activeScope.name === 'Minhas Tarefas') {
+    params.set('mine', '1');
   }
   const search = params.toString();
   return `${slug ? `/${slug}` : '/'}${search ? `?${search}` : ''}`;
@@ -1263,6 +1381,19 @@ export default function App() {
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [lists, setLists] = useState<List[]>([]);
+  // Fica `true` só depois que espaços/pastas/listas terminam de carregar (ver
+  // loadInitialData) — antes disso os índices de slug abaixo estão vazios, e
+  // qualquer URL de escopo (/suprimentos/importacao) cai no fallback global
+  // até esse flag virar true (ver efeito de entrada, mais abaixo).
+  const [workspaceMetaLoaded, setWorkspaceMetaLoaded] = useState(false);
+  const navSlugMaps = useMemo<NavSlugMaps>(() => ({
+    spaces,
+    folders,
+    lists,
+    spaceIndex: buildSlugIndex(spaces, s => s.id, s => s.name),
+    folderIndex: buildSlugIndex(folders, f => f.id, f => f.name, f => f.spaceId),
+    listIndex: buildSlugIndex(lists, l => l.id, l => l.name, l => l.folderId),
+  }), [spaces, folders, lists]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [myTasks, setMyTasks] = useState<Task[]>([]);
@@ -1308,7 +1439,7 @@ export default function App() {
   const navigate = useNavigate();
   const location = useLocation();
   const navigationType = useNavigationType();
-  const initialNav = parseNavPath(window.location.pathname, window.location.search);
+  const initialNav = parseNavPath(window.location.pathname, window.location.search, navSlugMaps);
 
   // Lista ativa (selecionada na sidebar) — afeta filtro e configuração de colunas por lista
   const [activeListId, setActiveListId] = useState<string | null>(() => initialNav.listId);
@@ -1338,7 +1469,7 @@ export default function App() {
   const [activeScope, setActiveScope] = useState<NavigationScope>(() => ({
     type: initialNav.scopeType,
     id: initialNav.scopeId,
-    name: initialNav.mine ? 'Minhas Tarefas' : (initialNav.scopeType === 'global' ? 'Dashboard' : ''),
+    name: initialNav.scopeName,
   }));
 
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(() => initialNav.taskId);
@@ -1563,6 +1694,7 @@ export default function App() {
         })));
       }
 
+      setWorkspaceMetaLoaded(true);
     } catch (err) {
       console.error('Erro ao carregar dados iniciais:', err);
     }
@@ -3007,36 +3139,46 @@ export default function App() {
   // setActiveListId/setActiveScope diretamente. Não inclui `location`/`navigate`
   // nas deps de propósito: só deve rodar quando o ESTADO de navegação muda, não
   // a cada mudança de URL (senão loopa com o efeito de entrada abaixo).
+  // Usada por este efeito E pelo de entrada logo abaixo — ver comentário lá.
+  const hasResolvedInitialUrlRef = useRef(false);
   useEffect(() => {
-    const targetPath = computeNavPath({ activeView, activeListId, activeScope, activeDocId, selectedTaskId }, location.search);
+    // Antes da primeira resolução (ver efeito de entrada logo abaixo), o
+    // estado inicial de uma URL tipo /suprimentos/importacao ainda não foi
+    // resolvido (índices de slug vazios) e vale um Dashboard/global
+    // provisório — se este efeito navegasse pra `/` nesse meio-tempo, o
+    // deep link seria destruído antes dos dados chegarem.
+    if (!hasResolvedInitialUrlRef.current) return;
+    const targetPath = computeNavPath({ activeView, activeListId, activeScope, activeDocId, selectedTaskId }, location.search, navSlugMaps);
     const currentPath = `${location.pathname}${location.search}`;
     if (targetPath !== currentPath) {
       navigate(targetPath);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeView, activeListId, activeScope.type, activeScope.id, activeScope.name, activeDocId, selectedTaskId]);
+  }, [activeView, activeListId, activeScope.type, activeScope.id, activeScope.name, activeDocId, selectedTaskId, navSlugMaps]);
 
-  // Entrada: aplica a URL de volta ao estado só quando ela mudou por ação do
-  // navegador (voltar/avançar, ou um link colado na barra) — `navigationType`
-  // do react-router distingue isso de uma navegação feita pelo efeito de saída
-  // acima (que usa PUSH). Sem esse filtro, os dois efeitos ficariam disputando
-  // entre si a cada navegação.
+  // Entrada: aplica a URL de volta ao estado. Roda em duas situações:
+  // (1) a URL mudou por ação do navegador (voltar/avançar, ou um link colado
+  // na barra) — `navigationType === 'POP'` distingue isso de uma navegação
+  // feita pelo efeito de saída acima (que usa PUSH), senão os dois efeitos
+  // ficariam disputando entre si a cada navegação; (2) a primeira vez que
+  // `workspaceMetaLoaded` vira true — nesse momento os índices de slug
+  // (navSlugMaps) finalmente conseguem resolver um path tipo
+  // /suprimentos/importacao que, no carregamento inicial (antes dos dados
+  // chegarem), só tinha caído no fallback Dashboard/global.
   useEffect(() => {
-    if (navigationType !== 'POP') return;
-    const parsed = parseNavPath(location.pathname, location.search);
+    if (!workspaceMetaLoaded) return;
+    const isFirstResolution = !hasResolvedInitialUrlRef.current;
+    hasResolvedInitialUrlRef.current = true;
+    if (!isFirstResolution && navigationType !== 'POP') return;
+    const parsed = parseNavPath(location.pathname, location.search, navSlugMaps);
     setActiveView(parsed.view);
     setActiveListId(parsed.listId);
     setActiveDocId(parsed.docId);
     setSelectedTaskId(parsed.taskId);
     setTaskCommentFocus(null);
-    const resolvedName = parsed.scopeType === 'space'
-      ? spaces.find((s: Space) => s.id === parsed.scopeId)?.name ?? ''
-      : parsed.scopeType === 'folder'
-        ? folders.find((f: Folder) => f.id === parsed.scopeId)?.name ?? ''
-        : parsed.mine ? 'Minhas Tarefas' : 'Dashboard';
-    setActiveScope({ type: parsed.scopeType, id: parsed.scopeId, name: resolvedName });
+    setActiveScope({ type: parsed.scopeType, id: parsed.scopeId, name: parsed.scopeName });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.pathname, location.search, navigationType]);
+  }, [location.pathname, location.search, navigationType, workspaceMetaLoaded, navSlugMaps]);
 
   const openAdminPanel = () => {
     setIsUserMenuOpen(false);
