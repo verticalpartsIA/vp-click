@@ -154,11 +154,44 @@ export function mapRowToTaskShell(d: TaskRow): Task {
 }
 
 // Paginação genérica: busca todas as páginas de `build` até esgotar.
+//
+// Com `countQuery`: pede a contagem exata primeiro (uma consulta leve, sem
+// linhas — `head: true`) e, sabendo o total, dispara TODAS as páginas de
+// dados em paralelo via Promise.all, em vez de uma atrás da outra. Sem isso,
+// um escopo grande (ex.: pasta com ~3400 tarefas = 4 páginas de 1000) somava
+// a latência de cada página em série — ~16s observados em produção pra essa
+// pasta específica (achado em 2026-09-06, /equipamentos/02-projeto-em-
+// andamento). Se a contagem falhar por qualquer motivo, cai pro loop
+// sequencial de sempre — nunca fica sem dado por causa dessa otimização.
 async function fetchAllPages<T>(
   build: (from: number, to: number) => PromiseLike<PostgrestResult<T>>,
   label: string,
   startFrom = 0,
+  countQuery?: () => PromiseLike<{ count: number | null; error: unknown }>,
 ): Promise<T[]> {
+  if (countQuery) {
+    try {
+      const { count, error: countError } = await countQuery();
+      if (!countError && typeof count === 'number') {
+        if (count <= startFrom) return [];
+        const pageStarts: number[] = [];
+        for (let from = startFrom; from < count; from += PAGE_SIZE) pageStarts.push(from);
+        const pages = await Promise.all(pageStarts.map((from) => build(from, from + PAGE_SIZE - 1)));
+        const all: T[] = [];
+        for (const { data: page, error } of pages) {
+          if (error) {
+            console.error(`taskRepo.${label}: erro ao paginar (paralelo):`, error);
+            throw error;
+          }
+          if (page) all.push(...page);
+        }
+        return all;
+      }
+    } catch (err) {
+      console.error(`taskRepo.${label}: contagem falhou, caindo para paginação sequencial:`, err);
+    }
+  }
+
   let all: T[] = [];
   let from = startFrom;
   while (true) {
@@ -230,6 +263,12 @@ export function fetchTaskRowsByListIds(listIds: string[] | null): Promise<TaskRo
         .range(from, to);
     },
     'fetchTaskRowsByListIds',
+    0,
+    async () => {
+      const q = supabase.from('tasks').select('id', { count: 'exact', head: true });
+      const { count, error } = await (listIds ? q.in('list_id', listIds) : q);
+      return { count, error };
+    },
   );
 }
 
@@ -248,6 +287,11 @@ export function fetchRemainingTaskRowsByListIds(listIds: string[] | null): Promi
     },
     'fetchRemainingTaskRowsByListIds',
     INITIAL_TASK_PAGE_SIZE,
+    async () => {
+      const q = supabase.from('tasks').select('id', { count: 'exact', head: true });
+      const { count, error } = await (listIds ? q.in('list_id', listIds) : q);
+      return { count, error };
+    },
   );
 }
 
@@ -263,6 +307,14 @@ export function fetchTaskRowsByListId(listId: string): Promise<TaskRow[]> {
       .order('id', { ascending: true })
       .range(from, to),
     'fetchTaskRowsByListId',
+    0,
+    async () => {
+      const { count, error } = await supabase
+        .from('tasks')
+        .select('id', { count: 'exact', head: true })
+        .eq('list_id', listId);
+      return { count, error };
+    },
   );
 }
 
@@ -281,6 +333,13 @@ export function fetchRemainingTaskRowsByListId(listId: string): Promise<TaskRow[
       .range(from, to),
     'fetchRemainingTaskRowsByListId',
     INITIAL_TASK_PAGE_SIZE,
+    async () => {
+      const { count, error } = await supabase
+        .from('tasks')
+        .select('id', { count: 'exact', head: true })
+        .eq('list_id', listId);
+      return { count, error };
+    },
   );
 }
 
