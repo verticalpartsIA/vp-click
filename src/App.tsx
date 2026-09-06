@@ -1965,8 +1965,16 @@ export default function App() {
       }
     }
 
-    return updateTask({ ...task, ...updates });
-  }, [tasks, updateTask]);
+    const ok = await updateTask({ ...task, ...updates });
+    // Achado na auditoria da Caixa de Entrada: esse é o caminho genérico da
+    // Tabela (dropdown de responsável por linha e atribuição em massa, que
+    // chama isso mesmo por tarefa) — nenhum dos dois notificava. Notifica só
+    // quando o responsável de fato muda.
+    if (ok && updates.mainAssigneeId !== undefined && updates.mainAssigneeId && updates.mainAssigneeId !== task.mainAssigneeId) {
+      notifyAssignment({ userIds: [updates.mainAssigneeId], actor: currentUser, taskId, taskTitle: task.title });
+    }
+    return ok;
+  }, [tasks, updateTask, currentUser]);
 
   // --- Bulk Actions (T701) ---
   const handleBulkStatusChange = async (ids: string[], status: string) => {
@@ -2531,9 +2539,16 @@ export default function App() {
       return false;
     }
 
+    // Achado na auditoria da Caixa de Entrada: só os botões de responsável do
+    // modal de detalhe notificavam — trocar por aqui (quick-edit do Kanban)
+    // não avisava ninguém. Notifica só quando o responsável de fato muda.
+    if (updates.mainAssigneeId !== undefined && updates.mainAssigneeId && updates.mainAssigneeId !== previous.mainAssigneeId) {
+      notifyAssignment({ userIds: [updates.mainAssigneeId], actor: currentUser, taskId, taskTitle: updates.title ?? previous.title });
+    }
+
     toast.success('Tarefa atualizada.');
     return true;
-  }, [tasks]);
+  }, [tasks, currentUser]);
 
   const handleUpdateFieldValue = useCallback(async (fieldId: string, entityId: string, value: any) => {
     const { error } = await supabase
