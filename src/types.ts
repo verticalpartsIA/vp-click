@@ -221,6 +221,17 @@ export interface Task {
   recurrenceParentTaskId?: string;
   recurrenceSequence?: number;
   scheduledOccurrenceAt?: string;
+  // Issue #185 — arquivar/excluir/restaurar, fase 1 (schema). Dimensões
+  // independentes do `status` (uma tarefa DONE pode estar arquivada ou não;
+  // uma tarefa ACTIVE pode estar na lixeira). `deletedAt` presente = na
+  // lixeira/quarentena (purga definitiva em `purgeAfter`, ~30 dias depois).
+  archivedAt?: string;
+  archivedBy?: string;
+  deletedAt?: string;
+  deletedBy?: string;
+  purgeAfter?: string;
+  deletionReasonCode?: string;
+  deletionReasonText?: string;
 }
 
 // ── Tarefas recorrentes (issue #184) ──────────────────────────────────────

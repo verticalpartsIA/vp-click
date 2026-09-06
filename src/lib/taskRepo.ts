@@ -42,6 +42,13 @@ const TASK_ROW_SELECT = [
   'recurrence_parent_task_id',
   'recurrence_sequence',
   'scheduled_occurrence_at',
+  'archived_at',
+  'archived_by',
+  'deleted_at',
+  'deleted_by',
+  'purge_after',
+  'deletion_reason_code',
+  'deletion_reason_text',
 ].join(',');
 
 // ── Formato cru das linhas do banco (snake_case) ────────────────────────────
@@ -67,6 +74,13 @@ export interface TaskRow {
   recurrence_parent_task_id: string | null;
   recurrence_sequence: number | null;
   scheduled_occurrence_at: string | null;
+  archived_at: string | null;
+  archived_by: string | null;
+  deleted_at: string | null;
+  deleted_by: string | null;
+  purge_after: string | null;
+  deletion_reason_code: string | null;
+  deletion_reason_text: string | null;
 }
 interface AttachmentRow { id: string; task_id: string; name: string; url: string; type: string; size: number; uploaded_at: string; }
 interface CommentRow {
@@ -148,6 +162,13 @@ const mapTaskCore = (d: TaskRow) => ({
   recurrenceParentTaskId: d.recurrence_parent_task_id || undefined,
   recurrenceSequence: d.recurrence_sequence ?? undefined,
   scheduledOccurrenceAt: d.scheduled_occurrence_at || undefined,
+  archivedAt: d.archived_at || undefined,
+  archivedBy: d.archived_by || undefined,
+  deletedAt: d.deleted_at || undefined,
+  deletedBy: d.deleted_by || undefined,
+  purgeAfter: d.purge_after || undefined,
+  deletionReasonCode: d.deletion_reason_code || undefined,
+  deletionReasonText: d.deletion_reason_text || undefined,
 });
 
 // Task "shell": campos preenchidos, sub-entidades vazias. Usado nas listagens,
