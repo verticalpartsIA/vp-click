@@ -1,16 +1,16 @@
-name: Deploy VPS (teste) — vpclick-teste.vpsistema.com
+name: Deploy VPS — vpclick.vpsistema.com
 
-# Disparo manual só (workflow_dispatch): não roda em push, não interfere
-# com o pipeline de produção (deploy.yml, que continua servindo
-# vpclick.vpsistema.com pela hospedagem compartilhada normalmente).
-# Existe pra validar a VPS num subdomínio de teste antes de qualquer
-# virada definitiva de DNS.
+# Disparo manual só (workflow_dispatch) por enquanto: esse pipeline ainda é
+# novo (migrado da hospedagem compartilhada Hostinger em 2026-09-06) e
+# convém confirmar alguns deploys manuais antes de deixar automático em
+# todo push. Depois de validado, trocar pra `on: push: branches: [main]`
+# como o deploy.yml antigo (hospedagem compartilhada).
 on:
   workflow_dispatch:
 
 jobs:
   deploy:
-    name: Build + Deploy VPS (Docker/Traefik)
+    name: Build + Deploy VPS (Docker + nginx do host)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,10 +30,16 @@ jobs:
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
           VITE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.VITE_SUPABASE_SERVICE_ROLE_KEY }}
 
-      # Chave dedicada só pra esse deploy (gerada nesta sessão, ainda não
-      # anexada à VPS nem gravada como secret — ver reports/09-vps-migration
-      # pra retomar de onde parou). Mesmo formato do secret HOSTINGER_SSH_KEY_B64
-      # já usado no deploy.yml: PEM cru OU base64 de linha única.
+      # A VPS NÃO usa Traefik pra tráfego real (o container Traefik existe
+      # mas nunca ficou publicado nas portas 80/443 do host). Quem serve
+      # todo o tráfego HTTPS é um nginx do sistema operacional (fora do
+      # Docker) com um vhost + certificado Certbot por domínio — mesmo
+      # padrão usado por requisicoes.vpsistema.com e mcp.vpsistema.com.
+      # Por isso este container só publica em 127.0.0.1:8091 (loopback) e o
+      # vhost /etc/nginx/sites-available/vpclick.vpsistema.com (já criado
+      # manualmente, com HTTPS via Certbot) faz o proxy_pass pra essa porta.
+      # Esse deploy NÃO mexe no vhost nginx nem no certificado — só atualiza
+      # o container com o build novo.
       - name: Deploy via SSH/SCP para a VPS (Docker)
         env:
           SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
@@ -64,30 +70,28 @@ jobs:
           SSH="ssh -i deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts $SSH_USER@$SSH_HOST"
           SCP="scp -i deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts"
 
-          # Primeira vez: garante a pasta base + config (docker-compose.yml e
-          # nginx.conf) presentes antes de subir o build.
           $SSH "mkdir -p '$REMOTE_BASE'"
           $SCP deploy/vps/vpclick/docker-compose.yml deploy/vps/vpclick/nginx.conf "$SSH_USER@$SSH_HOST:$REMOTE_BASE/"
 
           # Mesmo truque de troca atômica do deploy.yml: build novo vai pra
-          # staging, só vira "dist" (o que o nginx serve, via bind mount) depois
-          # de enviado por inteiro.
+          # staging, só vira "dist" (o que o nginx do container serve, via
+          # bind mount) depois de enviado por inteiro.
           $SSH "rm -rf '$STAGING_DIR' '$PREV_DIR' && mkdir -p '$STAGING_DIR'"
           $SCP -r dist/. "$SSH_USER@$SSH_HOST:$STAGING_DIR/"
           $SSH "if [ -d '$LIVE_DIR' ]; then mv '$LIVE_DIR' '$PREV_DIR'; fi && mv '$STAGING_DIR' '$LIVE_DIR'"
 
-          # Sobe (ou garante no ar) o serviço — bind mount já reflete o
+          # Sobe (ou garante no ar) o container — bind mount já reflete o
           # conteúdo novo sem precisar de restart, mas `up -d` garante que o
           # serviço exista na primeira execução.
           $SSH "cd '$REMOTE_BASE' && docker compose up -d"
 
           rm -f deploy_key
-          echo 'Deploy enviado para a VPS (vpclick-teste.vpsistema.com).'
+          echo 'Deploy enviado para a VPS (vpclick.vpsistema.com).'
 
-      - name: Verificar que o site de teste está servível
+      - name: Verificar que o site publicado está servível
         run: |
           set -e
-          SITE='https://vpclick-teste.vpsistema.com'
+          SITE='https://vpclick.vpsistema.com'
           echo "Buscando $SITE/index.html publicado..."
           curl --http1.1 --retry 5 --retry-delay 3 --retry-all-errors -fsS -H 'Cache-Control: no-cache' "$SITE/?cachebust=$GITHUB_RUN_ID" -o published.html
 
@@ -120,4 +124,4 @@ jobs:
           fi
 
           echo ''
-          echo '✅ Deploy de teste verificado: index.html e todos os assets respondendo na VPS.'
+          echo '✅ Deploy verificado: index.html e todos os assets respondendo na VPS.'
