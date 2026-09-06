@@ -8,7 +8,7 @@ import * as taskRepo from '../lib/taskRepo';
 // atividades recentes) + a lista de listas para rótulos. Recarrega ao entrar na
 // view de Dashboard. É "fino": a carga de dados vive no taskRepo; aqui só mora
 // o estado do React e o efeito de disparo.
-export function useDashboard(session: Session | null, activeView: string, listIds: string[]) {
+export function useDashboard(session: Session | null, activeView: string, listIds: string[] | null) {
   const [dashboardTasks, setDashboardTasks] = useState<Task[]>([]);
   const [dashboardLists, setDashboardLists] = useState<{ id: string; name: string }[]>([]);
   const [isDashboardLoading, setIsDashboardLoading] = useState(false);

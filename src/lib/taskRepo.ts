@@ -901,17 +901,22 @@ interface DashboardRow {
 // `lists`): sem esse filtro, o Postgres varre a tabela `tasks` inteira
 // avaliando a política de RLS linha a linha antes do LIMIT — 3-8s por
 // chamada em produção (visto em pg_stat_statements) e cresce com o volume
-// total de tarefas, não com o que o usuário realmente vê.
-export async function fetchDashboardData(listIds: string[]): Promise<{ tasks: Task[]; lists: { id: string; name: string }[] }> {
-  if (listIds.length === 0) return { tasks: [], lists: [] };
+// total de tarefas, não com o que o usuário realmente vê. `listIds === null`
+// pula o filtro (mesma convenção de fetchTaskRowsByListIds): para ADMIN, que
+// já enxerga todas as listas, o `.in()` com centenas de IDs só soma overhead
+// sem eliminar nenhuma linha (medido: ~40% mais lento por página, sem ganho).
+export async function fetchDashboardData(listIds: string[] | null): Promise<{ tasks: Task[]; lists: { id: string; name: string }[] }> {
+  if (listIds !== null && listIds.length === 0) return { tasks: [], lists: [] };
   const rows = await fetchAllPages<DashboardRow>(
-    (from, to) => supabase
-      .from('tasks')
-      .select('id, title, status, priority, main_assignee_id, start_date, due_date, extension_count, list_id, created_at')
-      .in('list_id', listIds)
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: true })
-      .range(from, to),
+    (from, to) => {
+      const q = supabase
+        .from('tasks')
+        .select('id, title, status, priority, main_assignee_id, start_date, due_date, extension_count, list_id, created_at');
+      return (listIds ? q.in('list_id', listIds) : q)
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: true })
+        .range(from, to);
+    },
     'fetchDashboardData',
   );
   if (rows.length === 0) return { tasks: [], lists: [] };
