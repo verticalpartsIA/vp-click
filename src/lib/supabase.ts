@@ -85,19 +85,31 @@ export async function fetchTaskDependencies(taskId: string): Promise<TaskDepende
 // Versão em lote de fetchTaskDependencies — usada pelo Gantt (Codex_Gantt_03/
 // #154), que precisa das dependências de dezenas/centenas de tarefas visíveis
 // de uma vez (setas + bloqueio + caminho crítico). Uma chamada por tarefa
-// vista faria N round-trips; aqui é sempre um só `IN (...)`.
+// vista faria N round-trips; aqui é um `IN (...)` por lote.
+// GanttView passa TODAS as tarefas do escopo (não só as na janela de datas
+// visível) — um espaço grande (ex.: ~5.900 tarefas) gera uma única URL com
+// milhares de UUIDs (~200KB+), que o navegador/servidor rejeita direto
+// (ERR_CONNECTION_RESET, reproduzido ao vivo). Mesmo chunk de 150 ids já
+// usado em taskRepo.ts (fetchSubEntityInChunks) pro mesmo problema com
+// task_id em outras sub-entidades.
+const TASK_DEPENDENCIES_CHUNK = 150;
 export async function fetchTaskDependenciesForTasks(taskIds: string[]): Promise<TaskDependency[]> {
   if (taskIds.length === 0) return [];
-  const { data, error } = await supabase
-    .from('task_dependencies')
-    .select(`
-      *,
-      depends_on_task:tasks!depends_on_id (id, title, status, priority)
-    `)
-    .in('task_id', taskIds);
+  const out: TaskDependency[] = [];
+  for (let i = 0; i < taskIds.length; i += TASK_DEPENDENCIES_CHUNK) {
+    const slice = taskIds.slice(i, i + TASK_DEPENDENCIES_CHUNK);
+    const { data, error } = await supabase
+      .from('task_dependencies')
+      .select(`
+        *,
+        depends_on_task:tasks!depends_on_id (id, title, status, priority)
+      `)
+      .in('task_id', slice);
 
-  if (error) throw error;
-  return (data ?? []) as TaskDependency[];
+    if (error) throw error;
+    if (data) out.push(...(data as TaskDependency[]));
+  }
+  return out;
 }
 
 export async function addTaskDependency(

@@ -8,7 +8,7 @@ import * as taskRepo from '../lib/taskRepo';
 // atividades recentes) + a lista de listas para rótulos. Recarrega ao entrar na
 // view de Dashboard. É "fino": a carga de dados vive no taskRepo; aqui só mora
 // o estado do React e o efeito de disparo.
-export function useDashboard(session: Session | null, activeView: string) {
+export function useDashboard(session: Session | null, activeView: string, listIds: string[] | null) {
   const [dashboardTasks, setDashboardTasks] = useState<Task[]>([]);
   const [dashboardLists, setDashboardLists] = useState<{ id: string; name: string }[]>([]);
   const [isDashboardLoading, setIsDashboardLoading] = useState(false);
@@ -22,7 +22,7 @@ export function useDashboard(session: Session | null, activeView: string) {
     if (!session) return;
     setIsDashboardLoading(true);
     try {
-      const { tasks: dashTasks, lists: dashLists } = await taskRepo.fetchDashboardData();
+      const { tasks: dashTasks, lists: dashLists } = await taskRepo.fetchDashboardData(listIds);
       setDashboardTasks(dashTasks);
       setDashboardLists(dashLists);
       hasRetriedRef.current = false;
@@ -40,7 +40,7 @@ export function useDashboard(session: Session | null, activeView: string) {
       setIsDashboardLoading(false);
       toast.error('Não foi possível carregar o Dashboard. Tente novamente.');
     }
-  }, [session]);
+  }, [session, listIds]);
 
   // Recarrega o Dashboard sempre que a view muda para Dashboard.
   useEffect(() => {

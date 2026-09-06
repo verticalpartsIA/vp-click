@@ -214,6 +214,83 @@ export interface Task {
   isMilestone?: boolean;
   tags?: string[];
   watcherIds?: string[];
+  // Issue #184 — tarefas recorrentes, fase 1 (schema). `recurrenceRuleId`
+  // presente = esta tarefa é uma ocorrência gerada por uma série; ausente =
+  // tarefa comum. Ver TaskRecurrenceRule.
+  recurrenceRuleId?: string;
+  recurrenceParentTaskId?: string;
+  recurrenceSequence?: number;
+  scheduledOccurrenceAt?: string;
+}
+
+// ── Tarefas recorrentes (issue #184) ──────────────────────────────────────
+// Fase 1: schema + RLS só. Motor de cálculo da próxima ocorrência e
+// scheduler server-side (Fase 2) e UI de configuração (Fase 3) ainda não
+// existem — este tipo já reflete a tabela `task_recurrence_rules` pra quem
+// for construir em cima.
+export type RecurrenceFrequencyType = 'daily' | 'weekly' | 'monthly' | 'yearly' | 'custom';
+export type RecurrenceTriggerMode = 'on_schedule' | 'on_complete' | 'days_after_complete';
+export type RecurrenceWeekendShift = 'next_business_day' | 'previous_business_day' | 'skip';
+export type RecurrenceEndMode = 'forever' | 'count' | 'until';
+export type RecurrenceOverlapPolicy = 'create_anyway' | 'skip_new' | 'postpone' | 'create_and_flag' | 'escalate';
+export type RecurrenceMisfirePolicy = 'skip_past' | 'create_latest_only' | 'create_all_up_to_limit';
+
+// Quais campos a nova ocorrência herda da tarefa-base — mapeia (e estende
+// quando preciso) DuplicateTaskOptions, sem duplicar a lógica de clonagem.
+export interface RecurrenceInheritOptions {
+  includeDescription?: boolean;
+  includeAssignees?: boolean;
+  includePriority?: boolean;
+  includeSubtasks?: boolean;
+  includeChecklists?: boolean;
+  includeChecklistCheckedState?: boolean;
+  includeTags?: boolean;
+  includeCustomFields?: boolean;
+  includeWatchers?: boolean;
+  includeAttachments?: boolean;
+  includeDependencies?: boolean;
+  remapSubtaskDates?: boolean;
+}
+
+export interface TaskRecurrenceRule {
+  id: string;
+  taskId: string;
+  listId: string;
+  createdBy?: string;
+  enabled: boolean;
+
+  frequencyType: RecurrenceFrequencyType;
+  interval: number;
+  weekdays: number[]; // 0=domingo..6=sábado
+  monthDay?: number;
+  monthWeek?: number; // 1..4, 5=último
+  monthWeekday?: number;
+
+  startAt: string;
+  nextRunAt?: string;
+  timezone: string;
+
+  triggerMode: RecurrenceTriggerMode;
+  daysAfterComplete?: number;
+
+  createNewTask: boolean;
+  skipWeekends: boolean;
+  skipHolidays: boolean;
+  weekendShift: RecurrenceWeekendShift;
+
+  endMode: RecurrenceEndMode;
+  endAt?: string;
+  maxOccurrences?: number;
+  occurrencesCreated: number;
+
+  updateStatusTo?: string;
+  inheritOptions: RecurrenceInheritOptions;
+  overlapPolicy: RecurrenceOverlapPolicy;
+  misfirePolicy: RecurrenceMisfirePolicy;
+
+  lastGeneratedAt?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 // ── Equipes (grupos de usuários, estilo ClickUp Teams) ───

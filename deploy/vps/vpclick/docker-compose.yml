@@ -1,0 +1,20 @@
+# Serve o build estático do vpclick (Vite/React) na VPS. O Traefik que
+# existe no host NUNCA ficou publicado nas portas 80/443 (quem serve todo
+# o tráfego real é um nginx do sistema operacional, fora do Docker, com um
+# vhost + certificado Certbot por domínio — ver /etc/nginx/sites-available/).
+# Por isso este container só publica a porta em 127.0.0.1 e o roteamento
+# HTTPS de verdade é feito pelo vhost nginx do host (mesmo padrão usado
+# por requisicoes.vpsistema.com e mcp.vpsistema.com).
+#
+# Nenhum processo Node.js aqui: o app é 100% estático (o pipeline do
+# GitHub Actions já faz `npm run build`), então nginx só serve arquivos —
+# uso de CPU/RAM é irrisório.
+services:
+  vpclick:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./dist:/usr/share/nginx/html:ro
+    ports:
+      - "127.0.0.1:8091:80"

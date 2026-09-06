@@ -1,0 +1,149 @@
+name: Deploy VPS — vpclick.vpsistema.com
+
+# Disparo manual só (workflow_dispatch) por enquanto: esse pipeline ainda é
+# novo (migrado da hospedagem compartilhada Hostinger em 2026-09-06) e
+# convém confirmar alguns deploys manuais antes de deixar automático em
+# todo push. Depois de validado, trocar pra `on: push: branches: [main]`
+# como o deploy.yml antigo (hospedagem compartilhada).
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build + Deploy VPS (Docker + nginx do host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Build producao
+        run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.VITE_SUPABASE_SERVICE_ROLE_KEY }}
+
+      # A VPS NÃO usa Traefik pra tráfego real (o container Traefik existe
+      # mas nunca ficou publicado nas portas 80/443 do host). Quem serve
+      # todo o tráfego HTTPS é um nginx do sistema operacional (fora do
+      # Docker) com um vhost + certificado Certbot por domínio — mesmo
+      # padrão usado por requisicoes.vpsistema.com e mcp.vpsistema.com.
+      # Por isso este container só publica em 127.0.0.1:8091 (loopback) e o
+      # vhost /etc/nginx/sites-available/vpclick.vpsistema.com (já criado
+      # manualmente, com HTTPS via Certbot) faz o proxy_pass pra essa porta.
+      # Esse deploy NÃO mexe no vhost nginx nem no certificado — só atualiza
+      # o container com o build novo.
+      - name: Deploy via SSH/SCP para a VPS (Docker)
+        env:
+          SSH_HOST: ${{ secrets.VPS_SSH_HOST }}
+          SSH_USER: ${{ secrets.VPS_SSH_USER }}
+          SSH_KEY_B64: ${{ secrets.VPS_SSH_KEY_B64 }}
+        run: |
+          set -e
+          printf '%s' "$SSH_KEY_B64" | tr -d '\r' > key_src
+          if grep -q 'PRIVATE KEY' key_src; then
+            cp key_src deploy_key
+          else
+            tr -d '[:space:]' < key_src | base64 -d > deploy_key 2>/dev/null \
+              || { echo 'ERRO: secret VPS_SSH_KEY_B64 não é PEM nem base64 válido'; exit 1; }
+          fi
+          rm -f key_src
+          chmod 600 deploy_key
+          head -n1 deploy_key | grep -q 'PRIVATE KEY' \
+            || { echo 'ERRO: conteúdo do secret não resultou numa chave privada válida'; exit 1; }
+
+          mkdir -p ~/.ssh
+          ssh-keyscan "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          REMOTE_BASE="/docker/vpclick"
+          LIVE_DIR="$REMOTE_BASE/dist"
+          STAGING_DIR="$REMOTE_BASE/dist_staging"
+          PREV_DIR="$REMOTE_BASE/dist_prev"
+
+          SSH="ssh -i deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts $SSH_USER@$SSH_HOST"
+          SCP="scp -i deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=~/.ssh/known_hosts"
+
+          $SSH "mkdir -p '$REMOTE_BASE'"
+          $SCP deploy/vps/vpclick/docker-compose.yml deploy/vps/vpclick/nginx.conf "$SSH_USER@$SSH_HOST:$REMOTE_BASE/"
+
+          # Mesmo truque de troca atômica do deploy.yml: build novo vai pra
+          # staging, só vira "dist" (o que o nginx do container serve, via
+          # bind mount) depois de enviado por inteiro.
+          $SSH "rm -rf '$STAGING_DIR' '$PREV_DIR' && mkdir -p '$STAGING_DIR'"
+          $SCP -r dist/. "$SSH_USER@$SSH_HOST:$STAGING_DIR/"
+          $SSH "if [ -d '$LIVE_DIR' ]; then mv '$LIVE_DIR' '$PREV_DIR'; fi && mv '$STAGING_DIR' '$LIVE_DIR'"
+
+          # Sobe (ou garante no ar) o container — `up -d` garante que o
+          # serviço exista na primeira execução. Diferente da hospedagem
+          # compartilhada antiga (deploy.yml), aqui o nginx roda DENTRO de um
+          # container com bind mount pra "dist": o `mv` acima troca o
+          # diretório por nome, mas o mount do container continua preso ao
+          # inode antigo (renomeado pra dist_prev) até o container reiniciar
+          # — sem o restart, o site fica servindo o build anterior
+          # silenciosamente (confirmado em produção em 2026-09-06: o deploy
+          # passou verde com o build antigo ainda no ar). `restart` reabre o
+          # bind mount contra o "dist" atual.
+          $SSH "cd '$REMOTE_BASE' && docker compose up -d && docker compose restart"
+
+          rm -f deploy_key
+          echo 'Deploy enviado para a VPS (vpclick.vpsistema.com).'
+
+      - name: Verificar que o site publicado está servível
+        run: |
+          set -e
+          SITE='https://vpclick.vpsistema.com'
+
+          # Checa PRIMEIRO se o commit servido é o que este run acabou de
+          # buildar — sem isso, o resto desta verificação pode passar verde
+          # mesmo servindo um build antigo (achado em produção 2026-09-06:
+          # bind mount do container ficava preso no diretório antigo depois
+          # do swap atômico, e o index.html antigo referenciava assets
+          # antigos que ainda existiam em disco, então tudo "batia").
+          echo "Conferindo se o commit publicado é $GITHUB_SHA..."
+          PUBLISHED_COMMIT=$(curl --http1.1 --retry 5 --retry-delay 3 --retry-all-errors -fsS "$SITE/version.json?cachebust=$GITHUB_RUN_ID" | grep -o '"commit": *"[^"]*"' | sed 's/.*"\([a-f0-9]*\)"/\1/')
+          if [ "$PUBLISHED_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "❌ Servidor está com o commit $PUBLISHED_COMMIT, esperado $GITHUB_SHA — o container não pegou o build novo (tente 'docker compose restart' na VPS)."
+            exit 1
+          fi
+          echo "✅ Commit publicado confere."
+
+          echo "Buscando $SITE/index.html publicado..."
+          curl --http1.1 --retry 5 --retry-delay 3 --retry-all-errors -fsS -H 'Cache-Control: no-cache' "$SITE/?cachebust=$GITHUB_RUN_ID" -o published.html
+
+          ASSETS=$(grep -oE '(src|href)="/assets/[^"]+"' published.html | sed 's/.*"\(.*\)"/\1/' | sort -u)
+          if [ -z "$ASSETS" ]; then
+            echo '❌ O index.html publicado não referencia nenhum asset — build ou envio inválido.'
+            exit 1
+          fi
+
+          FALHAS=0
+          for asset in $ASSETS; do
+            LINHA=$(curl --http1.1 --retry 3 --retry-delay 2 --retry-all-errors -s -o /dev/null -w '%{http_code} %{content_type}' "$SITE$asset")
+            CODE=${LINHA%% *}
+            TIPO=${LINHA#* }
+            if [ "$CODE" != "200" ]; then
+              echo "  FALHA $asset (HTTP $CODE)"
+              FALHAS=$((FALHAS + 1))
+            elif printf '%s' "$TIPO" | grep -qi 'text/html'; then
+              echo "  FALHA $asset (HTTP 200 mas veio HTML: '$TIPO' — arquivo não existe no servidor)"
+              FALHAS=$((FALHAS + 1))
+            else
+              echo "  ok   $asset ($TIPO)"
+            fi
+          done
+
+          if [ "$FALHAS" -gt 0 ]; then
+            echo ''
+            echo "❌ DEPLOY INCOMPLETO: $FALHAS asset(s) que a página precisa não estão no servidor."
+            exit 1
+          fi
+
+          echo ''
+          echo '✅ Deploy verificado: index.html e todos os assets respondendo na VPS.'

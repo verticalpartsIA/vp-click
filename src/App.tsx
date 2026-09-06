@@ -1,14 +1,17 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useNavigate, useLocation, useNavigationType, useSearchParams } from 'react-router-dom';
-import { MoreHorizontal, FileText, ListPlus, Link as LinkIcon, Image as ImageIcon, Paperclip, AlertTriangle as AlertTriangleIcon, Tag, Copy, ArrowUpDown, Search, Filter, RotateCcw, Check, X, Edit3, CalendarDays, UserCircle, Flag, MessageSquare, CheckSquare, GripVertical } from "lucide-react";
+import { MoreHorizontal, FileText, ListPlus, Link as LinkIcon, Image as ImageIcon, Paperclip, AlertTriangle as AlertTriangleIcon, Tag, Copy, ArrowUpDown, Search, Filter, RotateCcw, Check, X, Edit3, CalendarDays, UserCircle, Flag, MessageSquare, CheckSquare, GripVertical, Repeat, Pause, Play } from "lucide-react";
 import {
   User, Task, Workspace, Space, Folder, List, Project,
   UserRole, StatusType, StatusOption, StatusGroup, TaskPriority, ExtensionLog, Comment, ChecklistItem, Attachment,
-  CustomField, CustomFieldType, CustomFieldValue, CustomFieldOption, Doc, TaskActivity, WorkspaceTag, Team, AppNotification, DuplicateTaskOptions
+  CustomField, CustomFieldType, CustomFieldValue, CustomFieldOption, Doc, TaskActivity, WorkspaceTag, Team, AppNotification, DuplicateTaskOptions,
+  TaskRecurrenceRule, RecurrenceFrequencyType, RecurrenceWeekendShift, RecurrenceEndMode, RecurrenceOverlapPolicy, RecurrenceMisfirePolicy, RecurrenceInheritOptions
 } from './types';
 // import { MOCK_USERS, INITIAL_WORKSPACE, MOCK_SPACES, MOCK_FOLDERS, MOCK_LISTS, MOCK_TASKS, MOCK_PROJECTS, MOCK_CUSTOM_FIELDS, MOCK_CUSTOM_FIELD_VALUES } from './mockData';
 import { INITIAL_WORKSPACE, MOCK_PROJECTS } from './mockData'; // MOCK_PROJECTS temporário se ainda necessário
 import { Icons, PRIORITY_COLORS, COLORS } from './constants';
+import { calcNextValidOccurrence, RecurrenceRuleForCalc } from './lib/recurrence';
+import { fetchCompanyHolidays, addCompanyHoliday, deleteCompanyHoliday, CompanyHoliday } from './lib/holidaysRepo';
 import { WIKI_INTRO_HTML, WIKI_TEMPLATE_SECTIONS } from './wikiTemplate';
 import LoginScreen from './pages/LoginScreen';
 import ChangePasswordModal from './components/ChangePasswordModal';
@@ -16,6 +19,7 @@ import CreateListModal from './components/CreateListModal';
 import compactLogoWhite from './assets/logo-verticalparts-white.png';
 import bootLogoVideo from './assets/logo-limpo-video.mp4';
 import { recordRecentTaskId } from './lib/recentTasks';
+import { buildSlugIndex, slugify, type SlugIndex } from './lib/slug';
 import { lazyImportWithReload, clearChunkReloadFlag } from './lib/lazyRetry';
 import { supabase } from './lib/supabase';
 import * as taskRepo from './lib/taskRepo';
@@ -186,34 +190,151 @@ interface ParsedNav {
   listId: string | null;
   scopeType: ScopeType;
   scopeId: string | null;
+  scopeName: string;
   mine: boolean;
+  // Id completo — só quando veio do formato legado `?taskId=<uuid>` (já
+  // resolvido, não depende de `tasks` estar carregado).
   taskId: string | null;
+  // 8 primeiros chars do id — quando veio do path novo (.../tarefa/<slug>-
+  // <8chars>). Precisa ser resolvido contra `tasks` já carregado pra virar
+  // um `selectedTaskId` de verdade (ver `pendingTaskSlugId` no componente).
+  taskSlugId: string | null;
+}
+
+// Segmento fixo que marca "o que vem depois é uma tarefa aberta" na URL,
+// sempre no FINAL do path (depois de espaço/pasta/lista/view, se houver):
+// .../tarefa/<slug-do-titulo>-<8-chars-do-id>. Os 8 chars (não o título)
+// são a fonte da verdade — o título é só cosmético e pode ficar desatualizado
+// se a tarefa for renomeada depois; o link continua funcionando.
+const TASK_PATH_SEGMENT = 'tarefa';
+const TASK_SLUG_ID_RE = /-([0-9a-f]{8})$/;
+
+// Remove o `/tarefa/<slug>-<id>` do FINAL do path, se houver, devolvendo os
+// segmentos restantes (pra parsear escopo/view normalmente) + o id curto.
+function stripTaskSlugSegment(segments: string[]): { rest: string[]; taskSlugId: string | null } {
+  if (segments.length < 2 || segments[segments.length - 2] !== TASK_PATH_SEGMENT) {
+    return { rest: segments, taskSlugId: null };
+  }
+  const match = segments[segments.length - 1].match(TASK_SLUG_ID_RE);
+  if (!match) return { rest: segments, taskSlugId: null };
+  return { rest: segments.slice(0, -2), taskSlugId: match[1] };
+}
+
+// Índices slug<->id de espaços/pastas/listas, usados por parseNavPath (URL →
+// estado) e computeNavPath (estado → URL) pra trocar `?scope=space&scopeId=
+// <uuid>` por um path legível (`/suprimentos/importacao`). Ficam vazios até
+// os dados carregarem (ver `workspaceMetaLoaded`) — nesse meio-tempo qualquer
+// path de escopo cai no fallback global/Dashboard e é corrigido assim que os
+// índices ficarem prontos (ver efeito de entrada mais abaixo).
+interface NavSlugMaps {
+  spaces: Pick<Space, 'id' | 'name'>[];
+  folders: Pick<Folder, 'id' | 'name' | 'spaceId'>[];
+  lists: Pick<List, 'id' | 'name' | 'folderId'>[];
+  spaceIndex: SlugIndex;
+  folderIndex: SlugIndex;
+  listIndex: SlugIndex;
 }
 
 // URL → estado de navegação. Usada tanto na carga inicial (deep link/refresh)
 // quanto quando o usuário navega pelo botão voltar/avançar do navegador.
-function parseNavPath(pathname: string, search: string): ParsedNav {
-  const segments = pathname.split('/').filter(Boolean);
+function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): ParsedNav {
+  const rawSegments = pathname.split('/').filter(Boolean);
+  const { rest: segments, taskSlugId } = stripTaskSlugSegment(rawSegments);
   const params = new URLSearchParams(search);
+  // `?taskId=` legado tem prioridade — já é um id completo e resolvido, não
+  // depende de `tasks` estar carregado (ver taskSlugId, que sim depende).
   const taskId = params.get('taskId');
   if (segments[0] === 'doc') {
-    return { view: 'Doc', docId: segments[1] || null, listId: null, scopeType: 'global', scopeId: null, mine: false, taskId };
+    return { view: 'Doc', docId: segments[1] || null, listId: null, scopeType: 'global', scopeId: null, scopeName: '', mine: false, taskId, taskSlugId: taskId ? null : taskSlugId };
   }
-  const view = SLUG_TO_VIEW[segments[0] || ''] || 'Dashboard';
-  const listId = params.get('listId');
-  const scopeParam = params.get('scope');
-  const scopeId = params.get('scopeId');
-  const mine = params.get('mine') === '1';
-  const scopeType: ScopeType = (scopeParam === 'space' || scopeParam === 'folder') && scopeId ? scopeParam : 'global';
-  return {
-    view,
-    docId: null,
-    listId: WORKSPACE_VIEWS.includes(view) ? listId : null,
-    scopeType,
-    scopeId: scopeType === 'global' ? null : scopeId,
-    mine: WORKSPACE_VIEWS.includes(view) && mine,
-    taskId,
-  };
+
+  // Primeiro segmento bate com uma view conhecida (ou path vazio = raiz) →
+  // navegação "global" de sempre: view no path, escopo (se houver) em query
+  // params legados (?scope=&scopeId=, ?listId=) — mantém links antigos
+  // funcionando, o efeito de saída já reescreve pro formato novo em seguida.
+  if (segments[0] === undefined || segments[0] in SLUG_TO_VIEW) {
+    const view = SLUG_TO_VIEW[segments[0] || ''] || 'Dashboard';
+    const listId = params.get('listId');
+    const scopeParam = params.get('scope');
+    const scopeId = params.get('scopeId');
+    const mine = params.get('mine') === '1';
+    const scopeType: ScopeType = (scopeParam === 'space' || scopeParam === 'folder') && scopeId ? scopeParam : 'global';
+    const scopeName = scopeType === 'space'
+      ? slugMaps.spaces.find(s => s.id === scopeId)?.name ?? ''
+      : scopeType === 'folder'
+        ? slugMaps.folders.find(f => f.id === scopeId)?.name ?? ''
+        : mine ? 'Minhas Tarefas' : 'Dashboard';
+    return {
+      view,
+      docId: null,
+      listId: WORKSPACE_VIEWS.includes(view) ? listId : null,
+      scopeType,
+      scopeId: scopeType === 'global' ? null : scopeId,
+      scopeName,
+      mine: WORKSPACE_VIEWS.includes(view) && mine,
+      taskId,
+      taskSlugId: taskId ? null : taskSlugId,
+    };
+  }
+
+  // Primeiro segmento não é view conhecida → candidato a slug de espaço
+  // (/<space>[/<folder>[/<list>]][/<view>]). Se não resolver (slug inválido
+  // OU índices ainda vazios porque os dados não carregaram), cai no
+  // fallback Dashboard/global — o efeito de entrada re-tenta assim que os
+  // índices ficarem prontos.
+  const spaceId = slugMaps.spaceIndex.slugToId.get(` ${segments[0]}`);
+  const space = spaceId ? slugMaps.spaces.find(s => s.id === spaceId) : undefined;
+  if (!space) {
+    return { view: 'Dashboard', docId: null, listId: null, scopeType: 'global', scopeId: null, scopeName: 'Dashboard', mine: false, taskId, taskSlugId: taskId ? null : taskSlugId };
+  }
+
+  // O último segmento pode ser a view (list/kanban/calendar/gantt/table/
+  // dashboard) em vez de espaço/pasta/lista — ex.: /suprimentos/kanban ou
+  // /suprimentos/importacao/kanban. Separa antes de resolver pasta/lista.
+  const scopeSegments = segments.slice(1);
+  let viewSlug: string | null = null;
+  if (scopeSegments.length > 0) {
+    const last = scopeSegments[scopeSegments.length - 1];
+    const candidateView = SLUG_TO_VIEW[last];
+    if (candidateView && WORKSPACE_VIEWS.includes(candidateView)) {
+      viewSlug = last;
+      scopeSegments.pop();
+    }
+  }
+
+  let folderId: string | null = null;
+  let folderName = '';
+  if (scopeSegments[0]) {
+    const resolvedFolderId = slugMaps.folderIndex.slugToId.get(`${space.id} ${scopeSegments[0]}`);
+    const folder = resolvedFolderId ? slugMaps.folders.find(f => f.id === resolvedFolderId) : undefined;
+    if (folder) {
+      folderId = folder.id;
+      folderName = folder.name;
+    }
+  }
+
+  let listId: string | null = null;
+  if (folderId && scopeSegments[1]) {
+    const resolvedListId = slugMaps.listIndex.slugToId.get(`${folderId} ${scopeSegments[1]}`);
+    if (resolvedListId && slugMaps.lists.some(l => l.id === resolvedListId)) {
+      listId = resolvedListId;
+    }
+  }
+
+  // Dashboard (Overview) só existe pra escopo de ESPAÇO (SpaceOverview) — não
+  // há um "FolderOverview". O próprio handleNavigate já força `List` ao
+  // navegar pra pasta/lista pelo clique da sidebar; replicamos a mesma regra
+  // aqui pro default de uma URL sem segmento de view explícito, senão
+  // pasta/lista sem view cai no Dashboard GLOBAL (sem filtro de escopo) por
+  // engano. `?view=` continua aceito como fallback de link antigo.
+  const legacyViewParam = params.get('view');
+  const view = (viewSlug && SLUG_TO_VIEW[viewSlug])
+    || (legacyViewParam && SLUG_TO_VIEW[legacyViewParam])
+    || (folderId ? 'List' : 'Dashboard');
+  const scopeType: ScopeType = listId ? 'global' : folderId ? 'folder' : 'space';
+  const scopeId = listId ? null : folderId ?? space.id;
+  const scopeName = listId ? '' : folderId ? folderName : space.name;
+  return { view, docId: null, listId, scopeType, scopeId, scopeName, mine: false, taskId, taskSlugId: taskId ? null : taskSlugId };
 }
 
 // Estado de navegação → URL. `currentSearch` carrega params que não são de
@@ -222,18 +343,34 @@ function parseNavPath(pathname: string, search: string): ParsedNav {
 function computeNavPath(
   state: { activeView: ActiveView; activeListId: string | null; activeScope: NavigationScope; activeDocId: string | null; selectedTaskId: string | null },
   currentSearch: string,
+  slugMaps: NavSlugMaps,
+  tasksForTaskSlug: Pick<Task, 'id' | 'title'>[],
 ): string {
   const params = new URLSearchParams(currentSearch);
   params.delete('listId');
   params.delete('scope');
   params.delete('scopeId');
   params.delete('mine');
+  params.delete('view');
+  params.delete('taskId');
 
+  // Tarefa aberta vira `/tarefa/<slug-do-título>-<8-chars-do-id>` no FINAL
+  // do path (depois de escopo/view, se houver) — só os 8 chars do id são a
+  // fonte da verdade na hora de resolver de volta (ver parseNavPath), o
+  // título é cosmético e pode ficar desatualizado sem quebrar o link. Cai de
+  // volta pro `?taskId=` legado só se a tarefa ainda não estiver em `tasks`
+  // (não deveria acontecer: só chegamos aqui com selectedTaskId já
+  // confirmado presente).
+  let taskPathSuffix = '';
   if (state.selectedTaskId) {
-    params.set('taskId', state.selectedTaskId);
+    const task = tasksForTaskSlug.find(t => t.id === state.selectedTaskId);
+    if (task) {
+      taskPathSuffix = `/${TASK_PATH_SEGMENT}/${slugify(task.title)}-${task.id.slice(0, 8)}`;
+    } else {
+      params.set('taskId', state.selectedTaskId);
+    }
   } else {
     // Sem tarefa selecionada, `tab` (do modal fechado) também não faz sentido.
-    params.delete('taskId');
     params.delete('tab');
   }
 
@@ -246,25 +383,87 @@ function computeNavPath(
 
   if (state.activeView === 'Doc') {
     const search = params.toString();
-    return `/doc${state.activeDocId ? `/${state.activeDocId}` : ''}${search ? `?${search}` : ''}`;
+    return `/doc${state.activeDocId ? `/${state.activeDocId}` : ''}${taskPathSuffix}${search ? `?${search}` : ''}`;
   }
 
-  const slug = VIEW_TO_SLUG[state.activeView] ?? '';
-  if (WORKSPACE_VIEWS.includes(state.activeView)) {
-    if (state.activeListId) {
-      params.set('listId', state.activeListId);
-    } else if (state.activeScope.type === 'space' && state.activeScope.id) {
-      params.set('scope', 'space');
-      params.set('scopeId', state.activeScope.id);
-    } else if (state.activeScope.type === 'folder' && state.activeScope.id) {
-      params.set('scope', 'folder');
-      params.set('scopeId', state.activeScope.id);
-    } else if (state.activeScope.name === 'Minhas Tarefas') {
-      params.set('mine', '1');
+  if (!WORKSPACE_VIEWS.includes(state.activeView)) {
+    const slug = VIEW_TO_SLUG[state.activeView] ?? '';
+    const base = slug ? `/${slug}` : '/';
+    const search = params.toString();
+    return `${base}${taskPathSuffix}${search ? `?${search}` : ''}`;
+  }
+
+  // Tenta montar o path legível (/<space>[/<folder>[/<list>]]). Sem espaço
+  // resolvido (escopo global, ou "Minhas Tarefas", ou dados ainda não
+  // carregados), cai pro esquema antigo (view no path, escopo em query).
+  let spaceId: string | null = null;
+  let folderId: string | null = null;
+  if (state.activeListId) {
+    const list = slugMaps.lists.find(l => l.id === state.activeListId);
+    const folder = list ? slugMaps.folders.find(f => f.id === list.folderId) : undefined;
+    if (list && folder) {
+      folderId = folder.id;
+      spaceId = folder.spaceId;
     }
+  } else if (state.activeScope.type === 'folder' && state.activeScope.id) {
+    const folder = slugMaps.folders.find(f => f.id === state.activeScope.id);
+    if (folder) {
+      folderId = folder.id;
+      spaceId = folder.spaceId;
+    }
+  } else if (state.activeScope.type === 'space' && state.activeScope.id) {
+    spaceId = state.activeScope.id;
+  }
+
+  const spaceSlug = spaceId ? slugMaps.spaceIndex.idToSlug.get(spaceId) : undefined;
+  if (spaceSlug) {
+    const pathParts = [spaceSlug];
+    const folderSlug = folderId ? slugMaps.folderIndex.idToSlug.get(folderId) : undefined;
+    if (folderSlug) {
+      pathParts.push(folderSlug);
+      const listSlug = state.activeListId ? slugMaps.listIndex.idToSlug.get(state.activeListId) : undefined;
+      if (listSlug) pathParts.push(listSlug);
+    }
+    // View vira segmento de path (/suprimentos/kanban,
+    // /suprimentos/importacao/kanban) — só quando difere do default do
+    // escopo: Dashboard (Overview) pra espaço puro, List pra pasta/lista
+    // (não existe Overview de pasta — mesma regra de parseNavPath).
+    const defaultView: ActiveView = folderSlug ? 'List' : 'Dashboard';
+    if (state.activeView !== defaultView) {
+      pathParts.push(VIEW_TO_SLUG[state.activeView] || 'dashboard');
+    }
+    const search = params.toString();
+    return `/${pathParts.join('/')}${taskPathSuffix}${search ? `?${search}` : ''}`;
+  }
+
+  // Fallback legado: escopo ainda não resolvível em slug (índices vazios,
+  // ou é "Minhas Tarefas"/global) — mantém o comportamento anterior.
+  const slug = VIEW_TO_SLUG[state.activeView] ?? '';
+  if (state.activeListId) {
+    params.set('listId', state.activeListId);
+  } else if (state.activeScope.type === 'space' && state.activeScope.id) {
+    params.set('scope', 'space');
+    params.set('scopeId', state.activeScope.id);
+  } else if (state.activeScope.type === 'folder' && state.activeScope.id) {
+    params.set('scope', 'folder');
+    params.set('scopeId', state.activeScope.id);
+  } else if (state.activeScope.name === 'Minhas Tarefas') {
+    params.set('mine', '1');
   }
   const search = params.toString();
-  return `${slug ? `/${slug}` : '/'}${search ? `?${search}` : ''}`;
+  return `${slug ? `/${slug}` : '/'}${taskPathSuffix}${search ? `?${search}` : ''}`;
+}
+
+// Troca (ou adiciona) o sufixo `/tarefa/<slug>-<id>` no final de um pathname
+// — usado pelos botões "Compartilhar"/"Copiar link", que herdam o path da
+// página atual (espaço/pasta/lista/view) mas podem apontar pra uma tarefa
+// diferente da que está aberta ali (ex.: menu de contexto numa linha da
+// lista). Sem `task` carregado (raro — id vindo de fora do `tasks` atual),
+// só limpa um sufixo antigo e deixa o chamador decidir o fallback.
+function withTaskPathSuffix(pathname: string, task: { id: string; title: string } | undefined): string {
+  const base = pathname.replace(new RegExp(`/${TASK_PATH_SEGMENT}/[^/]+$`), '');
+  if (!task) return base;
+  return `${base}/${TASK_PATH_SEGMENT}/${slugify(task.title)}-${task.id.slice(0, 8)}`;
 }
 
 type DuplicateTaskBooleanOption = Exclude<keyof DuplicateTaskOptions, 'title' | 'listId'>;
@@ -1273,10 +1472,38 @@ export default function App() {
   const [spaces, setSpaces] = useState<Space[]>([]);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [lists, setLists] = useState<List[]>([]);
+  // Fica `true` só depois que espaços/pastas/listas terminam de carregar (ver
+  // loadInitialData) — antes disso os índices de slug abaixo estão vazios, e
+  // qualquer URL de escopo (/suprimentos/importacao) cai no fallback global
+  // até esse flag virar true (ver efeito de entrada, mais abaixo).
+  const [workspaceMetaLoaded, setWorkspaceMetaLoaded] = useState(false);
+  // `true` depois que a URL foi resolvida contra os dados reais pelo menos
+  // uma vez (ver efeito de entrada/saída, mais abaixo). Também usada por
+  // loadTasks (logo adiante): antes disso, activeView/activeScope ainda
+  // podem estar no fallback Dashboard/global temporário de uma URL tipo
+  // /suprimentos/importacao (índices de slug ainda vazios) — buscar tarefas
+  // pra esse escopo FALSO e concluir "não existe" apagava um selectedTaskId
+  // que só ainda não tinha tido chance de resolver pro escopo de verdade
+  // (achado testando link direto pra tarefa numa pasta grande, 2026-09-06).
+  const hasResolvedInitialUrlRef = useRef(false);
+  const navSlugMaps = useMemo<NavSlugMaps>(() => ({
+    spaces,
+    folders,
+    lists,
+    spaceIndex: buildSlugIndex(spaces, s => s.id, s => s.name),
+    folderIndex: buildSlugIndex(folders, f => f.id, f => f.name, f => f.spaceId),
+    listIndex: buildSlugIndex(lists, l => l.id, l => l.name, l => l.folderId),
+  }), [spaces, folders, lists]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [myTasks, setMyTasks] = useState<Task[]>([]);
   const [isTasksLoading, setIsTasksLoading] = useState(false);
+  // Diferente de isTasksLoading (que já vira false após só a 1ª página, pra
+  // UI parecer rápida — ver loadTasks): só vira true quando TODAS as páginas
+  // do escopo terminaram. Usado pelo efeito "tarefa não existe mais" logo
+  // abaixo, que senão dispara um falso positivo pra qualquer tarefa fora da
+  // 1ª leva de 100.
+  const [isTasksFullyLoaded, setIsTasksFullyLoaded] = useState(false);
   const [isMyTasksLoading, setIsMyTasksLoading] = useState(false);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
   const [fieldValues, setFieldValues] = useState<CustomFieldValue[]>([]);
@@ -1318,7 +1545,7 @@ export default function App() {
   const navigate = useNavigate();
   const location = useLocation();
   const navigationType = useNavigationType();
-  const initialNav = parseNavPath(window.location.pathname, window.location.search);
+  const initialNav = parseNavPath(window.location.pathname, window.location.search, navSlugMaps);
 
   // Lista ativa (selecionada na sidebar) — afeta filtro e configuração de colunas por lista
   const [activeListId, setActiveListId] = useState<string | null>(() => initialNav.listId);
@@ -1348,10 +1575,15 @@ export default function App() {
   const [activeScope, setActiveScope] = useState<NavigationScope>(() => ({
     type: initialNav.scopeType,
     id: initialNav.scopeId,
-    name: initialNav.mine ? 'Minhas Tarefas' : (initialNav.scopeType === 'global' ? 'Dashboard' : ''),
+    name: initialNav.scopeName,
   }));
 
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(() => initialNav.taskId);
+  // Id curto (8 chars) de uma URL tipo .../tarefa/<slug>-<8chars> ainda não
+  // resolvido pra um `selectedTaskId` completo — precisa esperar `tasks` do
+  // escopo carregar pra achar a tarefa correspondente (ver efeito de
+  // resolução logo após loadTasks, mais abaixo).
+  const [pendingTaskSlugId, setPendingTaskSlugId] = useState<string | null>(() => initialNav.taskSlugId);
   const [openMeetingId, setOpenMeetingId] = useState<string | null>(null);
   const handleOpenMeeting = (meetingId: string) => {
     setOpenMeetingId(meetingId);
@@ -1366,6 +1598,16 @@ export default function App() {
   const [fieldManagerListIdOverride, setFieldManagerListIdOverride] = useState<string | null>(null);
   const [taskToDuplicate, setTaskToDuplicate] = useState<Task | null>(null);
   const [isDuplicatingTask, setIsDuplicatingTask] = useState(false);
+  // Issue #184 fase 3: configuração de recorrência. A regra é carregada sob
+  // demanda quando o modal abre (uma tarefa tem no máximo 1 regra).
+  const [recurrenceConfigTask, setRecurrenceConfigTask] = useState<Task | null>(null);
+  const [recurrenceConfigRule, setRecurrenceConfigRule] = useState<TaskRecurrenceRule | null>(null);
+  const [isLoadingRecurrenceRule, setIsLoadingRecurrenceRule] = useState(false);
+  const [isSavingRecurrenceRule, setIsSavingRecurrenceRule] = useState(false);
+  // Regras das tarefas atualmente visíveis (carregado sob demanda por
+  // openTaskRecurrenceModal e após mutações) — usado só pro indicador dentro
+  // do TaskDetailModal, não precisa cobrir toda a lista/kanban.
+  const [taskRecurrenceRuleCache, setTaskRecurrenceRuleCache] = useState<Record<string, TaskRecurrenceRule | null>>({});
 
   // New State for Creation Modals
   const [isSpaceModalOpen, setIsSpaceModalOpen] = useState(false);
@@ -1394,8 +1636,20 @@ export default function App() {
     handleAdminCreateUser,
   } = useUsers({ session, currentUser, setCurrentUser, setUserAccess });
 
-  // Tarefas globais para o Dashboard (sempre todas, sem filtro de escopo)
-  const { dashboardTasks, dashboardLists, isDashboardLoading, loadDashboardTasks } = useDashboard(session, activeView);
+  // Listas acessíveis ao usuário (RLS já restringe `lists`): usadas para filtrar
+  // o Dashboard e os contadores por lista no servidor, em vez de varrer todas
+  // as tarefas avaliando a RLS linha a linha.
+  const countListIds = useMemo(() => lists.map((l) => l.id), [lists]);
+
+  // Dashboard: ADMIN já enxerga todas as listas (RLS permite tudo), então o
+  // filtro por list_id só soma overhead ao `.in()` com centenas de IDs sem
+  // eliminar nenhuma linha (medido: ~40% mais lento por página). `null` pula
+  // o filtro nesse caso; GESTOR/COLABORADOR seguem filtrados por countListIds.
+  const dashboardListIds = currentUser.role === UserRole.ADMIN ? null : countListIds;
+
+  // Tarefas do Dashboard, filtradas pelas listas acessíveis ao usuário (ou sem
+  // filtro para ADMIN — ver dashboardListIds acima).
+  const { dashboardTasks, dashboardLists, isDashboardLoading, loadDashboardTasks } = useDashboard(session, activeView, dashboardListIds);
 
   const loadInitialData = useCallback(async () => {
     try {
@@ -1561,6 +1815,7 @@ export default function App() {
         })));
       }
 
+      setWorkspaceMetaLoaded(true);
     } catch (err) {
       console.error('Erro ao carregar dados iniciais:', err);
     }
@@ -1633,10 +1888,8 @@ export default function App() {
   const [isSearching, setIsSearching] = useState(false);
   // Contadores exatos por lista (badges da sidebar + progresso da SpaceOverview),
   // independentes do escopo carregado. `refreshTaskCountIndex` é religado no
-  // realtime abaixo.
-  // Filtra os contadores pelas listas acessíveis (RLS restringe `lists`): usa o
-  // índice em vez de varrer todas as ~7k tarefas avaliando a RLS por linha.
-  const countListIds = useMemo(() => lists.map((l) => l.id), [lists]);
+  // realtime abaixo. `countListIds` é calculado mais acima (reaproveitado
+  // também pelo Dashboard).
   const { listTaskCounts, listProgressMap, refreshTaskCountIndex } = useTaskCountIndex(session, countListIds);
 
   // `?taskId=` na carga inicial (deep link) já é lido pelo inicializador de
@@ -1646,6 +1899,22 @@ export default function App() {
   // navegador) são tratadas pelo efeito de entrada logo após handleNavigate.
 
   const selectedTask = useMemo(() => tasks.find(t => t.id === selectedTaskId), [tasks, selectedTaskId]);
+
+  // Carrega a regra de recorrência da tarefa aberta (se houver) só pro
+  // indicador visual no TaskDetailModal — não bloqueia a UI, chave ausente no
+  // cache = "ainda não checou", null = "checou, não tem regra".
+  useEffect(() => {
+    if (!selectedTask) return;
+    let cancelled = false;
+    setTaskRecurrenceRuleCache((prev) => {
+      if (selectedTask.id in prev) return prev; // já checado — não refaz a busca
+      taskRepo.fetchRecurrenceRuleForTask(selectedTask.id).then((rule) => {
+        if (!cancelled) setTaskRecurrenceRuleCache((cur) => ({ ...cur, [selectedTask.id]: rule }));
+      });
+      return prev;
+    });
+    return () => { cancelled = true; };
+  }, [selectedTask]);
 
   // Qual comentário deixar rolado/destacado (e qual ação já deixar pronta —
   // responder ou resolver) quando a tarefa é aberta a partir de uma
@@ -1661,12 +1930,29 @@ export default function App() {
   // e não dava nenhuma pista do porquê. `tasks.length > 0` evita um falso
   // positivo enquanto a lista ainda está carregando pela primeira vez.
   useEffect(() => {
-    if (selectedTaskId && tasks.length > 0 && !tasks.some(t => t.id === selectedTaskId)) {
+    if (selectedTaskId && isTasksFullyLoaded && !tasks.some(t => t.id === selectedTaskId)) {
       toast.error('Essa tarefa não existe mais ou você não tem acesso a ela.');
       setSelectedTaskId(null);
       setTaskCommentFocus(null);
     }
-  }, [selectedTaskId, tasks]);
+  }, [selectedTaskId, tasks, isTasksFullyLoaded]);
+
+  // Resolve .../tarefa/<slug>-<8chars> (ver pendingTaskSlugId) assim que
+  // `tasks` do escopo carregar por completo: acha a tarefa cujo id começa
+  // com esses 8 chars e vira selectedTaskId de verdade. Mesmo aviso de "não
+  // existe mais" do efeito acima quando o escopo já carregou e ninguém bate
+  // — espera `isTasksFullyLoaded`, não só a 1ª página, senão uma tarefa fora
+  // das primeiras 100 (ordenadas por created_at) parecia "não existir".
+  useEffect(() => {
+    if (!pendingTaskSlugId || !isTasksFullyLoaded) return;
+    const match = tasks.find(t => t.id.startsWith(pendingTaskSlugId));
+    if (match) {
+      setSelectedTaskId(match.id);
+    } else {
+      toast.error('Essa tarefa não existe mais ou você não tem acesso a ela.');
+    }
+    setPendingTaskSlugId(null);
+  }, [pendingTaskSlugId, tasks, isTasksFullyLoaded]);
 
   // Card "Recentes" de Minhas Tarefas: registra toda tarefa aberta, pra
   // qualquer entrada (clique na lista, notificação, link direto etc.).
@@ -1735,11 +2021,37 @@ export default function App() {
 
   const loadTasks = useCallback(async () => {
     if (!session) return;
+    // `currentUser` ainda é o placeholder FALLBACK_USER (id 'loading') logo
+    // após o login, antes do perfil real chegar — chamar fetchMyTaskRows com
+    // esse id gera 400 (uuid inválido) toda vez que "Minhas Tarefas" carrega
+    // nessa janela. O efeito que dispara loadTasks já reage a mudanças de
+    // currentUser.id (ver abaixo), então essa corrida se resolve sozinha.
+    if (currentUser.id === 'loading') return;
+    // Antes da URL ser resolvida contra os dados reais (ver
+    // hasResolvedInitialUrlRef), activeView/activeScope ainda podem estar no
+    // fallback Dashboard/global temporário de uma URL tipo
+    // /suprimentos/importacao — buscar tarefas pra esse escopo FALSO batia
+    // isGlobalDashboard, marcava `isTasksFullyLoaded` na hora e apagava um
+    // selectedTaskId (vindo de ?taskId= ou já resolvido) que só ainda não
+    // tinha tido chance de carregar no escopo de verdade. O efeito de
+    // entrada sempre cria um `activeScope` novo (objeto novo, mesmo quando o
+    // valor não muda), então este loadTasks dispara de novo assim que ele
+    // rodar — não fica travado pra sempre.
+    if (!hasResolvedInitialUrlRef.current) return;
 
     const requestId = ++loadTasksRequestIdRef.current;
+    // "Tarefa não existe mais" (ver efeito logo abaixo) só pode confiar em
+    // `tasks` depois que a carga estiver DE VERDADE completa — a 1ª página
+    // (100 linhas) já dispara `tasks.length > 0` bem antes das páginas
+    // restantes chegarem, e uma tarefa fora dessas 100 primeiras (ordenadas
+    // por created_at) parecia "não existir" e fechava o modal sozinha
+    // (achado testando link direto pra uma tarefa antiga numa pasta com
+    // 3374 tarefas, 2026-09-06).
+    setIsTasksFullyLoaded(false);
     const isGlobalDashboard = activeView === 'Dashboard' && activeScope.type === 'global' && !activeListId;
     if (isGlobalDashboard) {
       setIsTasksLoading(false);
+      setIsTasksFullyLoaded(true);
       return;
     }
 
@@ -1759,6 +2071,7 @@ export default function App() {
           for (const t of mappedTasks) merged.set(t.id, preserveLoadedTaskDetails(t, merged.get(t.id)));
           return Array.from(merged.values());
         });
+        setIsTasksFullyLoaded(true);
       } catch (err) {
         console.error('Erro ao carregar Minhas Tarefas:', err);
         if (requestId === loadTasksRequestIdRef.current && !loadTasksRetriedRef.current) {
@@ -1802,6 +2115,7 @@ export default function App() {
         // sempre (a cada volta a 1ª página carregava OK e zerava a flag nesse
         // ponto de novo) sem nunca chegar no toast de erro terminal.
         loadTasksRetriedRef.current = false;
+        setIsTasksFullyLoaded(true);
         return;
       }
 
@@ -1814,6 +2128,7 @@ export default function App() {
         .map(taskRepo.mapRowToTaskShell)
         .map(task => preserveLoadedTaskDetails(task, prev.find(existing => existing.id === task.id))));
       loadTasksRetriedRef.current = false;
+      setIsTasksFullyLoaded(true);
     } catch (err) {
       console.error('Erro ao carregar tarefas:', err);
       if (requestId === loadTasksRequestIdRef.current && !loadTasksRetriedRef.current) {
@@ -1825,6 +2140,7 @@ export default function App() {
         setTimeout(() => { loadTasksRef.current?.(); }, 1500);
       } else {
         loadTasksRetriedRef.current = false;
+        setIsTasksFullyLoaded(true);
         toast.error('Não foi possível carregar as tarefas. Tente novamente.');
       }
     } finally {
@@ -1959,8 +2275,16 @@ export default function App() {
       }
     }
 
-    return updateTask({ ...task, ...updates });
-  }, [tasks, updateTask]);
+    const ok = await updateTask({ ...task, ...updates });
+    // Achado na auditoria da Caixa de Entrada: esse é o caminho genérico da
+    // Tabela (dropdown de responsável por linha e atribuição em massa, que
+    // chama isso mesmo por tarefa) — nenhum dos dois notificava. Notifica só
+    // quando o responsável de fato muda.
+    if (ok && updates.mainAssigneeId !== undefined && updates.mainAssigneeId && updates.mainAssigneeId !== task.mainAssigneeId) {
+      notifyAssignment({ userIds: [updates.mainAssigneeId], actor: currentUser, taskId, taskTitle: task.title });
+    }
+    return ok;
+  }, [tasks, updateTask, currentUser]);
 
   // --- Bulk Actions (T701) ---
   const handleBulkStatusChange = async (ids: string[], status: string) => {
@@ -2525,9 +2849,16 @@ export default function App() {
       return false;
     }
 
+    // Achado na auditoria da Caixa de Entrada: só os botões de responsável do
+    // modal de detalhe notificavam — trocar por aqui (quick-edit do Kanban)
+    // não avisava ninguém. Notifica só quando o responsável de fato muda.
+    if (updates.mainAssigneeId !== undefined && updates.mainAssigneeId && updates.mainAssigneeId !== previous.mainAssigneeId) {
+      notifyAssignment({ userIds: [updates.mainAssigneeId], actor: currentUser, taskId, taskTitle: updates.title ?? previous.title });
+    }
+
     toast.success('Tarefa atualizada.');
     return true;
-  }, [tasks]);
+  }, [tasks, currentUser]);
 
   const handleUpdateFieldValue = useCallback(async (fieldId: string, entityId: string, value: any) => {
     const { error } = await supabase
@@ -2788,12 +3119,13 @@ export default function App() {
       // `toISOString()` converte para UTC: à noite no Brasil (UTC-3) já é o dia
       // seguinte em UTC, o que fazia tarefas criadas de noite nascerem com data
       // de início/prazo erradas. Usamos data local.
+      const mainAssigneeId = newTaskPartial.mainAssigneeId || currentUser.id;
       const res = await taskRepo.insertTask({
         title: newTaskPartial.title || 'Nova Tarefa',
         description: newTaskPartial.description || '',
         status: newTaskPartial.status || defaultStatus,
         priority: newTaskPartial.priority || TaskPriority.MEDIA,
-        mainAssigneeId: newTaskPartial.mainAssigneeId || currentUser.id,
+        mainAssigneeId,
         secondaryAssigneeIds: [],
         startDate: formatLocalDate(new Date()),
         // Sem prazo inventado (achado de QA): antes toda tarefa nova sem
@@ -2812,6 +3144,11 @@ export default function App() {
         if (belongsToMyTasks(res.task)) {
           setMyTasks(prev => [res.task, ...prev.filter(t => t.id !== res.task.id)]);
         }
+        // Achado na auditoria da Caixa de Entrada: só as trocas de responsável
+        // em tarefa já existente notificavam (handleSetMainAssignee etc.) —
+        // criar já atribuída a outra pessoa não avisava ninguém.
+        // notifyAssignment já filtra auto-notificação (criador = responsável).
+        notifyAssignment({ userIds: [mainAssigneeId], actor: currentUser, taskId: res.task.id, taskTitle: res.task.title });
         setIsTaskModalOpen(false);
         setPrefilledTaskData(null);
         toast.success('Tarefa criada com sucesso!');
@@ -2950,6 +3287,72 @@ export default function App() {
     }
   };
 
+  // Issue #184 fase 3: abre o modal de recorrência buscando a regra atual da
+  // tarefa (null se ainda não tem uma configurada — o modal nasce em modo
+  // "criar" nesse caso).
+  const openTaskRecurrenceModal = async (task: Task) => {
+    setRecurrenceConfigTask(task);
+    setIsLoadingRecurrenceRule(true);
+    try {
+      const rule = await taskRepo.fetchRecurrenceRuleForTask(task.id);
+      setRecurrenceConfigRule(rule);
+      setTaskRecurrenceRuleCache((prev) => ({ ...prev, [task.id]: rule }));
+    } finally {
+      setIsLoadingRecurrenceRule(false);
+    }
+  };
+
+  const handleSaveRecurrenceRule = async (input: Omit<taskRepo.RecurrenceRuleInput, 'taskId' | 'listId' | 'createdBy'>) => {
+    if (!recurrenceConfigTask || isSavingRecurrenceRule) return;
+    setIsSavingRecurrenceRule(true);
+    try {
+      const res = await taskRepo.upsertRecurrenceRule(
+        {
+          ...input,
+          taskId: recurrenceConfigTask.id,
+          listId: recurrenceConfigTask.listId as string,
+          createdBy: currentUser.id,
+        },
+        recurrenceConfigRule?.id ?? null,
+      );
+      if ('error' in res) throw new Error(res.error);
+      setTaskRecurrenceRuleCache((prev) => ({ ...prev, [recurrenceConfigTask.id]: res.rule }));
+      setRecurrenceConfigTask(null);
+      setRecurrenceConfigRule(null);
+      toast.success('Recorrência configurada com sucesso.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error('Erro ao salvar recorrência: ' + message);
+    } finally {
+      setIsSavingRecurrenceRule(false);
+    }
+  };
+
+  const handleToggleRecurrenceEnabled = async (rule: TaskRecurrenceRule, enabled: boolean) => {
+    const { error } = await taskRepo.setRecurrenceRuleEnabled(rule.id, enabled);
+    if (error) {
+      toast.error('Erro ao ' + (enabled ? 'retomar' : 'pausar') + ' recorrência: ' + error);
+      return;
+    }
+    const updated = { ...rule, enabled };
+    setTaskRecurrenceRuleCache((prev) => ({ ...prev, [rule.taskId]: updated }));
+    if (recurrenceConfigRule?.id === rule.id) setRecurrenceConfigRule(updated);
+    toast.success(enabled ? 'Recorrência retomada.' : 'Recorrência pausada.');
+  };
+
+  const handleDeleteRecurrenceRule = async (rule: TaskRecurrenceRule) => {
+    if (!window.confirm('Excluir a configuração de recorrência desta tarefa? As ocorrências já criadas não são apagadas.')) return;
+    const { error } = await taskRepo.deleteRecurrenceRule(rule.id);
+    if (error) {
+      toast.error('Erro ao excluir recorrência: ' + error);
+      return;
+    }
+    setTaskRecurrenceRuleCache((prev) => ({ ...prev, [rule.taskId]: null }));
+    setRecurrenceConfigTask(null);
+    setRecurrenceConfigRule(null);
+    toast.success('Recorrência removida.');
+  };
+
   const openFolderModal = (spaceId: string) => {
     setTargetSpaceId(spaceId);
     setIsFolderModalOpen(true);
@@ -2980,36 +3383,54 @@ export default function App() {
   // setActiveListId/setActiveScope diretamente. Não inclui `location`/`navigate`
   // nas deps de propósito: só deve rodar quando o ESTADO de navegação muda, não
   // a cada mudança de URL (senão loopa com o efeito de entrada abaixo).
+  // hasResolvedInitialUrlRef declarada lá em cima (perto de workspaceMetaLoaded)
+  // — também usada por loadTasks. Usada por este efeito E pelo de entrada logo abaixo.
   useEffect(() => {
-    const targetPath = computeNavPath({ activeView, activeListId, activeScope, activeDocId, selectedTaskId }, location.search);
+    // Antes da primeira resolução (ver efeito de entrada logo abaixo), o
+    // estado inicial de uma URL tipo /suprimentos/importacao ainda não foi
+    // resolvido (índices de slug vazios) e vale um Dashboard/global
+    // provisório — se este efeito navegasse pra `/` nesse meio-tempo, o
+    // deep link seria destruído antes dos dados chegarem. Mesma lógica pra
+    // pendingTaskSlugId: enquanto .../tarefa/<slug>-<id> ainda não resolveu
+    // pra um selectedTaskId de verdade, esse efeito reescreveria a URL sem
+    // o segmento de tarefa (selectedTaskId ainda é null) — espera resolver.
+    if (!hasResolvedInitialUrlRef.current || pendingTaskSlugId) return;
+    const targetPath = computeNavPath({ activeView, activeListId, activeScope, activeDocId, selectedTaskId }, location.search, navSlugMaps, tasks);
     const currentPath = `${location.pathname}${location.search}`;
     if (targetPath !== currentPath) {
       navigate(targetPath);
     }
+    // `tasks` está nas deps só por causa do sufixo /tarefa/<slug>-<id>: uma
+    // tarefa aberta antes de `tasks` do escopo terminar de carregar cai no
+    // `?taskId=` legado (ver computeNavPath) até `tasks` chegar com o título
+    // — sem essa dep, o efeito não roda de novo pra promover a URL.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeView, activeListId, activeScope.type, activeScope.id, activeScope.name, activeDocId, selectedTaskId]);
+  }, [activeView, activeListId, activeScope.type, activeScope.id, activeScope.name, activeDocId, selectedTaskId, navSlugMaps, pendingTaskSlugId, tasks]);
 
-  // Entrada: aplica a URL de volta ao estado só quando ela mudou por ação do
-  // navegador (voltar/avançar, ou um link colado na barra) — `navigationType`
-  // do react-router distingue isso de uma navegação feita pelo efeito de saída
-  // acima (que usa PUSH). Sem esse filtro, os dois efeitos ficariam disputando
-  // entre si a cada navegação.
+  // Entrada: aplica a URL de volta ao estado. Roda em duas situações:
+  // (1) a URL mudou por ação do navegador (voltar/avançar, ou um link colado
+  // na barra) — `navigationType === 'POP'` distingue isso de uma navegação
+  // feita pelo efeito de saída acima (que usa PUSH), senão os dois efeitos
+  // ficariam disputando entre si a cada navegação; (2) a primeira vez que
+  // `workspaceMetaLoaded` vira true — nesse momento os índices de slug
+  // (navSlugMaps) finalmente conseguem resolver um path tipo
+  // /suprimentos/importacao que, no carregamento inicial (antes dos dados
+  // chegarem), só tinha caído no fallback Dashboard/global.
   useEffect(() => {
-    if (navigationType !== 'POP') return;
-    const parsed = parseNavPath(location.pathname, location.search);
+    if (!workspaceMetaLoaded) return;
+    const isFirstResolution = !hasResolvedInitialUrlRef.current;
+    hasResolvedInitialUrlRef.current = true;
+    if (!isFirstResolution && navigationType !== 'POP') return;
+    const parsed = parseNavPath(location.pathname, location.search, navSlugMaps);
     setActiveView(parsed.view);
     setActiveListId(parsed.listId);
     setActiveDocId(parsed.docId);
     setSelectedTaskId(parsed.taskId);
+    setPendingTaskSlugId(parsed.taskSlugId);
     setTaskCommentFocus(null);
-    const resolvedName = parsed.scopeType === 'space'
-      ? spaces.find((s: Space) => s.id === parsed.scopeId)?.name ?? ''
-      : parsed.scopeType === 'folder'
-        ? folders.find((f: Folder) => f.id === parsed.scopeId)?.name ?? ''
-        : parsed.mine ? 'Minhas Tarefas' : 'Dashboard';
-    setActiveScope({ type: parsed.scopeType, id: parsed.scopeId, name: resolvedName });
+    setActiveScope({ type: parsed.scopeType, id: parsed.scopeId, name: parsed.scopeName });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [location.pathname, location.search, navigationType]);
+  }, [location.pathname, location.search, navigationType, workspaceMetaLoaded, navSlugMaps]);
 
   const openAdminPanel = () => {
     setIsUserMenuOpen(false);
@@ -3978,6 +4399,8 @@ export default function App() {
               }}
               onDelete={() => handleDeleteTask(selectedTask.id)}
               onDuplicate={() => setTaskToDuplicate(selectedTask)}
+              onConfigureRecurrence={() => openTaskRecurrenceModal(selectedTask)}
+              recurrenceRule={taskRecurrenceRuleCache[selectedTask.id]}
               onSelectTask={setSelectedTaskId}
               onQuickCreate={(prefill?: any) => {
                 setPrefilledTaskData(prefill || null);
@@ -4047,6 +4470,21 @@ export default function App() {
           onDuplicate={(options) => {
             if (taskToDuplicate) handleDuplicateTask(taskToDuplicate, options);
           }}
+        />
+
+        <RecurrenceConfigModal
+          task={recurrenceConfigTask}
+          rule={recurrenceConfigRule}
+          isOpen={!!recurrenceConfigTask}
+          isLoading={isLoadingRecurrenceRule}
+          isSubmitting={isSavingRecurrenceRule}
+          onClose={() => {
+            if (!isSavingRecurrenceRule) { setRecurrenceConfigTask(null); setRecurrenceConfigRule(null); }
+          }}
+          onSave={handleSaveRecurrenceRule}
+          onToggleEnabled={handleToggleRecurrenceEnabled}
+          onDelete={handleDeleteRecurrenceRule}
+          currentUser={currentUser}
         />
 
         {/* Custom Fields Manager */}
@@ -6196,6 +6634,634 @@ function DuplicateTaskModal({
 
 // parseLocalDate / formatLocalDate agora vivem em ./lib/dates (issue #102,
 // achado 3) — importadas no topo deste arquivo.
+const WEEKDAY_LABELS = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+const NTH_WEEK_LABELS: Record<number, string> = { 1: '1ª', 2: '2ª', 3: '3ª', 4: '4ª', 5: 'última' };
+
+// Converte um Date pra valor de <input type="datetime-local"> no fuso local
+// do navegador (não usa toISOString — isso converteria pra UTC e descolaria
+// a hora exibida da hora que o usuário quis dizer).
+function toDatetimeLocalValue(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+export interface RecurrenceFormState {
+  frequencyType: RecurrenceFrequencyType;
+  interval: number;
+  weekdays: number[];
+  monthMode: 'day' | 'nth';
+  monthDay: number;
+  monthWeek: number;
+  monthWeekday: number;
+  startAt: string; // valor de datetime-local
+  skipWeekends: boolean;
+  skipHolidays: boolean;
+  weekendShift: RecurrenceWeekendShift;
+  endMode: RecurrenceEndMode;
+  endAt: string; // valor de date
+  maxOccurrences: number;
+  inheritOptions: RecurrenceInheritOptions;
+  overlapPolicy: RecurrenceOverlapPolicy;
+  misfirePolicy: RecurrenceMisfirePolicy;
+}
+
+export function defaultRecurrenceForm(task: Task | null): RecurrenceFormState {
+  const now = new Date();
+  now.setMinutes(0, 0, 0);
+  now.setHours(now.getHours() + 1);
+  return {
+    frequencyType: 'weekly',
+    interval: 1,
+    weekdays: task ? [now.getDay()] : [1],
+    monthMode: 'day',
+    monthDay: now.getDate(),
+    monthWeek: 1,
+    monthWeekday: 1,
+    startAt: toDatetimeLocalValue(now),
+    skipWeekends: false,
+    skipHolidays: false,
+    weekendShift: 'next_business_day',
+    endMode: 'forever',
+    endAt: '',
+    maxOccurrences: 10,
+    inheritOptions: {
+      includeDescription: true, includePriority: true, includeAssignees: true, includeTags: true,
+      includeSubtasks: false, remapSubtaskDates: true, includeChecklists: false, includeChecklistCheckedState: false,
+      includeCustomFields: false, includeWatchers: false,
+    },
+    overlapPolicy: 'create_and_flag',
+    misfirePolicy: 'create_latest_only',
+  };
+}
+
+function ruleToRecurrenceForm(rule: TaskRecurrenceRule): RecurrenceFormState {
+  return {
+    frequencyType: rule.frequencyType,
+    interval: rule.interval,
+    weekdays: rule.weekdays.length > 0 ? rule.weekdays : [1],
+    monthMode: rule.monthWeek != null && rule.monthWeekday != null ? 'nth' : 'day',
+    monthDay: rule.monthDay ?? new Date(rule.startAt).getDate(),
+    monthWeek: rule.monthWeek ?? 1,
+    monthWeekday: rule.monthWeekday ?? 1,
+    startAt: toDatetimeLocalValue(new Date(rule.startAt)),
+    skipWeekends: rule.skipWeekends,
+    skipHolidays: rule.skipHolidays,
+    weekendShift: rule.weekendShift,
+    endMode: rule.endMode,
+    endAt: rule.endAt ? rule.endAt.slice(0, 10) : '',
+    maxOccurrences: rule.maxOccurrences ?? 10,
+    inheritOptions: rule.inheritOptions,
+    overlapPolicy: rule.overlapPolicy,
+    misfirePolicy: rule.misfirePolicy,
+  };
+}
+
+// Valida o formulário e monta o payload que o backend consome — extraído do
+// componente pra ser testável sem precisar montar o Dialog (issue #184 seção
+// 30, "teste E2E/Cypress para configuração da recorrência pela UI": o
+// projeto não usa Cypress, então a cobertura equivalente aqui é testar essa
+// função pura diretamente, no mesmo estilo Vitest já usado no resto do repo).
+export function buildRecurrenceRuleInput(
+  form: RecurrenceFormState,
+): { input: Omit<import('./lib/taskRepo').RecurrenceRuleInput, 'taskId' | 'listId' | 'createdBy'> } | { error: string } {
+  const startAtDate = new Date(form.startAt);
+  if (Number.isNaN(startAtDate.getTime())) {
+    return { error: 'Informe uma data/hora de início válida.' };
+  }
+  if (form.frequencyType === 'weekly' && form.weekdays.length === 0) {
+    return { error: 'Selecione ao menos um dia da semana.' };
+  }
+
+  return {
+    input: {
+      frequencyType: form.frequencyType,
+      interval: Math.max(1, form.interval),
+      weekdays: form.frequencyType === 'weekly' ? form.weekdays : [],
+      monthDay: form.frequencyType === 'monthly' && form.monthMode === 'day' ? form.monthDay : null,
+      monthWeek: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeek : null,
+      monthWeekday: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeekday : null,
+      startAt: startAtDate.toISOString(),
+      // A primeira ocorrência gerada é exatamente o start_at — o scheduler
+      // avança a partir daí a cada execução (ver task-recurrence-scheduler).
+      nextRunAt: startAtDate.toISOString(),
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo',
+      skipWeekends: form.skipWeekends,
+      skipHolidays: form.skipHolidays,
+      weekendShift: form.weekendShift,
+      endMode: form.endMode,
+      endAt: form.endMode === 'until' && form.endAt ? new Date(`${form.endAt}T23:59:59`).toISOString() : null,
+      maxOccurrences: form.endMode === 'count' ? Math.max(1, form.maxOccurrences) : null,
+      inheritOptions: form.inheritOptions,
+      overlapPolicy: form.overlapPolicy,
+      misfirePolicy: form.misfirePolicy,
+    },
+  };
+}
+
+// Modal de configuração de recorrência (issue #184, fase 3). Cria ou edita a
+// ÚNICA regra da tarefa — o motor de cálculo e o scheduler (pg_cron + Edge
+// Function task-recurrence-scheduler) já rodam em produção desde a fase 2;
+// este modal só monta o RecurrenceRuleInput que o backend consome.
+function RecurrenceConfigModal({
+  task,
+  rule,
+  isOpen,
+  isLoading,
+  isSubmitting,
+  onClose,
+  onSave,
+  onToggleEnabled,
+  onDelete,
+  currentUser,
+}: {
+  task: Task | null;
+  rule: TaskRecurrenceRule | null;
+  isOpen: boolean;
+  isLoading: boolean;
+  isSubmitting: boolean;
+  onClose: () => void;
+  onSave: (input: Omit<import('./lib/taskRepo').RecurrenceRuleInput, 'taskId' | 'listId' | 'createdBy'>) => void;
+  onToggleEnabled: (rule: TaskRecurrenceRule, enabled: boolean) => void;
+  onDelete: (rule: TaskRecurrenceRule) => void;
+  currentUser: User;
+}) {
+  const [form, setForm] = useState<RecurrenceFormState>(() => defaultRecurrenceForm(task));
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setForm(rule ? ruleToRecurrenceForm(rule) : defaultRecurrenceForm(task));
+  }, [isOpen, rule, task]);
+
+  const toggleWeekday = (day: number) => {
+    setForm((prev) => ({
+      ...prev,
+      weekdays: prev.weekdays.includes(day) ? prev.weekdays.filter((d) => d !== day) : [...prev.weekdays, day].sort(),
+    }));
+  };
+
+  const toggleInherit = (key: keyof RecurrenceInheritOptions, value: boolean) => {
+    setForm((prev) => ({ ...prev, inheritOptions: { ...prev.inheritOptions, [key]: value } }));
+  };
+
+  const handleSubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (isSubmitting) return;
+    const result = buildRecurrenceRuleInput(form);
+    if ('error' in result) {
+      toast.error(result.error);
+      return;
+    }
+    onSave(result.input);
+  };
+
+  const inheritItems: Array<{ key: keyof RecurrenceInheritOptions; label: string }> = [
+    { key: 'includeDescription', label: 'Descrição' },
+    { key: 'includePriority', label: 'Prioridade' },
+    { key: 'includeAssignees', label: 'Responsáveis' },
+    { key: 'includeTags', label: 'Etiquetas' },
+    { key: 'includeSubtasks', label: 'Subtarefas' },
+    { key: 'includeChecklists', label: 'Checklists' },
+    { key: 'includeCustomFields', label: 'Campos personalizados' },
+    { key: 'includeWatchers', label: 'Observadores' },
+  ];
+
+  const [isHolidaysManagerOpen, setIsHolidaysManagerOpen] = useState(false);
+
+  // Preview client-side das próximas ocorrências previstas (issue #184
+  // seção 25 — "ocorrências futuras virtuais"): calcula sem materializar
+  // nada no banco, reaproveitando o mesmo motor puro do scheduler.
+  const [holidaysForPreview, setHolidaysForPreview] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!isOpen) return;
+    fetchCompanyHolidays().then((rows) => setHolidaysForPreview(new Set(rows.map((h) => h.date))));
+  }, [isOpen]);
+
+  const upcomingPreview = useMemo(() => {
+    const startAtDate = new Date(form.startAt);
+    if (Number.isNaN(startAtDate.getTime())) return [];
+    const ruleForCalc: RecurrenceRuleForCalc = {
+      frequencyType: form.frequencyType,
+      interval: Math.max(1, form.interval),
+      weekdays: form.frequencyType === 'weekly' ? form.weekdays : [],
+      monthDay: form.frequencyType === 'monthly' && form.monthMode === 'day' ? form.monthDay : null,
+      monthWeek: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeek : null,
+      monthWeekday: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeekday : null,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo',
+      skipWeekends: form.skipWeekends,
+      skipHolidays: form.skipHolidays,
+      weekendShift: form.weekendShift,
+    };
+    const dates: Date[] = [startAtDate];
+    let cursor = startAtDate;
+    for (let i = 0; i < 4; i++) {
+      const next = calcNextValidOccurrence(ruleForCalc, cursor, startAtDate, holidaysForPreview);
+      if (!next) break;
+      dates.push(next);
+      cursor = next;
+    }
+    return dates;
+  }, [form.startAt, form.frequencyType, form.interval, form.weekdays, form.monthMode, form.monthDay, form.monthWeek, form.monthWeekday, form.skipWeekends, form.skipHolidays, form.weekendShift, holidaysForPreview]);
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="max-w-2xl p-0 overflow-hidden max-h-[85vh] flex flex-col">
+        <form onSubmit={handleSubmit} className="flex flex-col overflow-hidden">
+          <DialogHeader className="px-6 pt-6 pb-4 border-b bg-gray-50/60 shrink-0">
+            <DialogTitle className="flex items-center gap-2 text-xl">
+              <Repeat className="w-5 h-5 text-blue-500" />
+              {rule ? 'Editar recorrência' : 'Configurar recorrência'}
+            </DialogTitle>
+            <DialogDescription>
+              Uma nova ocorrência desta tarefa é criada automaticamente conforme a frequência abaixo.
+            </DialogDescription>
+          </DialogHeader>
+
+          {isLoading ? (
+            <div className="p-8 text-center text-sm text-gray-400">Carregando...</div>
+          ) : (
+            <div className="p-6 space-y-5 overflow-y-auto">
+              {rule && (
+                <div className="flex items-center justify-between rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-600">
+                  <span>
+                    {rule.enabled ? 'Ativa' : 'Pausada'} · {rule.occurrencesCreated} ocorrência{rule.occurrencesCreated === 1 ? '' : 's'} criada{rule.occurrencesCreated === 1 ? '' : 's'}
+                    {rule.nextRunAt && rule.enabled && ` · próxima em ${new Date(rule.nextRunAt).toLocaleString('pt-BR')}`}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onToggleEnabled(rule, !rule.enabled)}
+                    className="flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2 py-1 font-semibold text-gray-600 hover:bg-gray-100"
+                  >
+                    {rule.enabled ? <><Pause className="w-3 h-3" /> Pausar</> : <><Play className="w-3 h-3" /> Retomar</>}
+                  </button>
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">Frequência</label>
+                  <select
+                    value={form.frequencyType}
+                    onChange={(e) => setForm((prev) => ({ ...prev, frequencyType: e.target.value as RecurrenceFrequencyType }))}
+                    className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="daily">Diária</option>
+                    <option value="weekly">Semanal</option>
+                    <option value="monthly">Mensal</option>
+                    <option value="yearly">Anual</option>
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">A cada</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      value={form.interval}
+                      onChange={(e) => setForm((prev) => ({ ...prev, interval: Number(e.target.value) || 1 }))}
+                      className="w-20 rounded-xl border border-gray-200 bg-white px-3 py-3 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                    />
+                    <span className="text-sm text-gray-500">
+                      {{ daily: 'dia(s)', weekly: 'semana(s)', monthly: 'mês(es)', yearly: 'ano(s)', custom: 'período(s)' }[form.frequencyType]}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {form.frequencyType === 'weekly' && (
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">Dias da semana</label>
+                  <div className="flex gap-1.5">
+                    {WEEKDAY_LABELS.map((label, day) => (
+                      <button
+                        key={day}
+                        type="button"
+                        onClick={() => toggleWeekday(day)}
+                        className={`w-10 h-10 rounded-lg text-xs font-bold transition-colors ${form.weekdays.includes(day) ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {form.frequencyType === 'monthly' && (
+                <div className="space-y-2">
+                  <div className="flex gap-4 text-sm">
+                    <label className="flex items-center gap-2">
+                      <input type="radio" checked={form.monthMode === 'day'} onChange={() => setForm((prev) => ({ ...prev, monthMode: 'day' }))} />
+                      Dia fixo do mês
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input type="radio" checked={form.monthMode === 'nth'} onChange={() => setForm((prev) => ({ ...prev, monthMode: 'nth' }))} />
+                      Em um dia específico
+                    </label>
+                  </div>
+                  {form.monthMode === 'day' ? (
+                    <input
+                      type="number"
+                      min={1}
+                      max={31}
+                      value={form.monthDay}
+                      onChange={(e) => setForm((prev) => ({ ...prev, monthDay: Number(e.target.value) || 1 }))}
+                      className="w-24 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                    />
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={form.monthWeek}
+                        onChange={(e) => setForm((prev) => ({ ...prev, monthWeek: Number(e.target.value) }))}
+                        className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                      >
+                        {[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{NTH_WEEK_LABELS[n]}</option>)}
+                      </select>
+                      <select
+                        value={form.monthWeekday}
+                        onChange={(e) => setForm((prev) => ({ ...prev, monthWeekday: Number(e.target.value) }))}
+                        className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                      >
+                        {WEEKDAY_LABELS.map((label, day) => <option key={day} value={day}>{label}-feira</option>)}
+                      </select>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-gray-700">Início da primeira ocorrência</label>
+                <input
+                  type="datetime-local"
+                  value={form.startAt}
+                  onChange={(e) => setForm((prev) => ({ ...prev, startAt: e.target.value }))}
+                  className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-sm font-semibold text-gray-700">
+                  <Checkbox checked={form.skipWeekends} onCheckedChange={(c) => setForm((prev) => ({ ...prev, skipWeekends: c === true }))} />
+                  Pular fins de semana
+                </label>
+                {form.skipWeekends && (
+                  <select
+                    value={form.weekendShift}
+                    onChange={(e) => setForm((prev) => ({ ...prev, weekendShift: e.target.value as RecurrenceWeekendShift }))}
+                    className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="next_business_day">Mover para o próximo dia útil</option>
+                    <option value="previous_business_day">Mover para o dia útil anterior</option>
+                    <option value="skip">Pular esta ocorrência</option>
+                  </select>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <label className="flex items-center justify-between gap-2 text-sm font-semibold text-gray-700">
+                  <span className="flex items-center gap-2">
+                    <Checkbox checked={form.skipHolidays} onCheckedChange={(c) => setForm((prev) => ({ ...prev, skipHolidays: c === true }))} />
+                    Pular feriados
+                  </span>
+                  <button type="button" onClick={() => setIsHolidaysManagerOpen(true)} className="text-xs font-medium text-blue-500 hover:underline">
+                    Gerenciar feriados
+                  </button>
+                </label>
+              </div>
+
+              {upcomingPreview.length > 1 && (
+                <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-600">
+                  <p className="mb-1 font-semibold text-gray-700">Próximas ocorrências previstas</p>
+                  <p>{upcomingPreview.map((d) => d.toLocaleDateString('pt-BR')).join(' · ')}</p>
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <label className="text-sm font-semibold text-gray-700">Encerramento</label>
+                <div className="flex gap-4 text-sm mb-2">
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={form.endMode === 'forever'} onChange={() => setForm((prev) => ({ ...prev, endMode: 'forever' }))} /> Nunca</label>
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={form.endMode === 'count'} onChange={() => setForm((prev) => ({ ...prev, endMode: 'count' }))} /> Após N vezes</label>
+                  <label className="flex items-center gap-1.5"><input type="radio" checked={form.endMode === 'until'} onChange={() => setForm((prev) => ({ ...prev, endMode: 'until' }))} /> Até uma data</label>
+                </div>
+                {form.endMode === 'count' && (
+                  <input
+                    type="number"
+                    min={1}
+                    value={form.maxOccurrences}
+                    onChange={(e) => setForm((prev) => ({ ...prev, maxOccurrences: Number(e.target.value) || 1 }))}
+                    className="w-24 rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  />
+                )}
+                {form.endMode === 'until' && (
+                  <input
+                    type="date"
+                    value={form.endAt}
+                    onChange={(e) => setForm((prev) => ({ ...prev, endAt: e.target.value }))}
+                    className="rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  />
+                )}
+              </div>
+
+              <div>
+                <p className="text-sm font-semibold text-gray-700 mb-2">O que herdar na nova ocorrência</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {inheritItems.map((item) => (
+                    <label key={item.key} className="flex items-center gap-2 rounded-xl border border-gray-200 bg-white p-2.5 hover:border-blue-200 cursor-pointer">
+                      <Checkbox checked={Boolean(form.inheritOptions[item.key])} onCheckedChange={(c) => toggleInherit(item.key, c === true)} />
+                      <span className="text-sm text-gray-700">{item.label}</span>
+                    </label>
+                  ))}
+                </div>
+                {form.inheritOptions.includeSubtasks && (
+                  <label className="mt-2 flex items-center gap-2 rounded-xl border border-gray-200 bg-white p-2.5 hover:border-blue-200 cursor-pointer">
+                    <Checkbox checked={Boolean(form.inheritOptions.remapSubtaskDates)} onCheckedChange={(c) => toggleInherit('remapSubtaskDates', c === true)} />
+                    <span className="text-sm text-gray-700">Remapear datas das subtarefas (preserva o intervalo em relação à tarefa-pai)</span>
+                  </label>
+                )}
+                {form.inheritOptions.includeChecklists && (
+                  <label className="mt-2 flex items-center gap-2 rounded-xl border border-gray-200 bg-white p-2.5 hover:border-blue-200 cursor-pointer">
+                    <Checkbox checked={Boolean(form.inheritOptions.includeChecklistCheckedState)} onCheckedChange={(c) => toggleInherit('includeChecklistCheckedState', c === true)} />
+                    <span className="text-sm text-gray-700">Manter itens de checklist já marcados como concluídos</span>
+                  </label>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">Se a anterior ainda está aberta</label>
+                  <select
+                    value={form.overlapPolicy}
+                    onChange={(e) => setForm((prev) => ({ ...prev, overlapPolicy: e.target.value as RecurrenceOverlapPolicy }))}
+                    className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="create_anyway">Criar normalmente</option>
+                    <option value="create_and_flag">Criar e sinalizar</option>
+                    <option value="escalate">Criar e notificar</option>
+                    <option value="skip_new">Pular esta ocorrência</option>
+                    <option value="postpone">Esperar a anterior fechar</option>
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-semibold text-gray-700">Se o sistema ficou parado</label>
+                  <select
+                    value={form.misfirePolicy}
+                    onChange={(e) => setForm((prev) => ({ ...prev, misfirePolicy: e.target.value as RecurrenceMisfirePolicy }))}
+                    className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2.5 text-sm font-medium text-gray-900 outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-100"
+                  >
+                    <option value="skip_past">Pular ocorrências atrasadas</option>
+                    <option value="create_latest_only">Criar só a mais recente</option>
+                    <option value="create_all_up_to_limit">Criar todas as atrasadas</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <DialogFooter className="px-6 py-4 border-t bg-gray-50/80 shrink-0">
+            {rule && (
+              <button
+                type="button"
+                onClick={() => onDelete(rule)}
+                disabled={isSubmitting}
+                className="mr-auto px-4 py-2 rounded-lg border border-red-200 bg-white text-sm font-semibold text-red-500 hover:bg-red-50 disabled:opacity-50"
+              >
+                Excluir recorrência
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={isSubmitting}
+              className="px-4 py-2 rounded-lg border border-gray-200 bg-white text-sm font-semibold text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              disabled={isSubmitting || isLoading}
+              className="px-5 py-2 rounded-lg bg-[var(--primary-color)] text-[#2c3e50] text-sm font-black hover:brightness-95 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isSubmitting ? 'Salvando...' : rule ? 'Salvar alterações' : 'Ativar recorrência'}
+            </button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+      <HolidaysManagerModal
+        isOpen={isHolidaysManagerOpen}
+        onClose={() => setIsHolidaysManagerOpen(false)}
+        onChanged={(holidays) => setHolidaysForPreview(new Set(holidays.map((h) => h.date)))}
+        currentUser={currentUser}
+      />
+    </Dialog>
+  );
+}
+
+// Modal auxiliar do "Pular feriados" — CRUD do calendário corporativo
+// (issue #184 seção 11). Escrita restrita a is_manager() via RLS; qualquer
+// autenticado só lê (a própria regra de recorrência de um colaborador
+// precisa enxergar os feriados pra calcular o deslocamento corretamente).
+function HolidaysManagerModal({
+  isOpen,
+  onClose,
+  onChanged,
+  currentUser,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  onChanged: (holidays: CompanyHoliday[]) => void;
+  currentUser: User;
+}) {
+  const [holidays, setHolidays] = useState<CompanyHoliday[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [newDate, setNewDate] = useState('');
+  const [newName, setNewName] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+
+  const reload = async () => {
+    setIsLoading(true);
+    const rows = await fetchCompanyHolidays();
+    setHolidays(rows);
+    onChanged(rows);
+    setIsLoading(false);
+  };
+
+  useEffect(() => {
+    if (isOpen) reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
+
+  const canManage = currentUser?.role === 'ADMIN' || currentUser?.role === 'GESTOR';
+
+  const handleAdd = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newDate || !newName.trim() || isSaving) return;
+    setIsSaving(true);
+    try {
+      const res = await addCompanyHoliday(newDate, newName, currentUser.id);
+      if ('error' in res) throw new Error(res.error);
+      setNewDate('');
+      setNewName('');
+      await reload();
+    } catch (err) {
+      toast.error('Erro ao adicionar feriado: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    const { error } = await deleteCompanyHoliday(id);
+    if (error) { toast.error('Erro ao excluir feriado: ' + error); return; }
+    await reload();
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="max-w-md p-0 overflow-hidden max-h-[80vh] flex flex-col">
+        <DialogHeader className="px-6 pt-6 pb-4 border-b bg-gray-50/60 shrink-0">
+          <DialogTitle className="text-lg">Calendário de feriados</DialogTitle>
+          <DialogDescription>Usado por qualquer regra com "Pular feriados" ativado.</DialogDescription>
+        </DialogHeader>
+
+        <div className="p-6 space-y-4 overflow-y-auto">
+          {canManage && (
+            <form onSubmit={handleAdd} className="flex items-end gap-2">
+              <div className="flex-1 space-y-1">
+                <label className="text-xs font-semibold text-gray-500">Data</label>
+                <input type="date" value={newDate} onChange={(e) => setNewDate(e.target.value)} className="w-full rounded-lg border border-gray-200 px-2 py-1.5 text-sm outline-none focus:border-blue-400" />
+              </div>
+              <div className="flex-1 space-y-1">
+                <label className="text-xs font-semibold text-gray-500">Nome</label>
+                <input type="text" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Ex.: Natal" className="w-full rounded-lg border border-gray-200 px-2 py-1.5 text-sm outline-none focus:border-blue-400" />
+              </div>
+              <button type="submit" disabled={isSaving} className="px-3 py-1.5 rounded-lg bg-[var(--primary-color)] text-[#2c3e50] text-sm font-bold disabled:opacity-50">+</button>
+            </form>
+          )}
+
+          {isLoading ? (
+            <p className="text-sm text-gray-400">Carregando...</p>
+          ) : holidays.length === 0 ? (
+            <p className="text-sm text-gray-400">Nenhum feriado cadastrado ainda.</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {holidays.map((h) => (
+                <li key={h.id} className="flex items-center justify-between rounded-lg border border-gray-100 bg-gray-50 px-3 py-2 text-sm">
+                  <span>
+                    <span className="font-semibold text-gray-700">{new Date(`${h.date}T00:00:00`).toLocaleDateString('pt-BR')}</span>
+                    <span className="text-gray-500"> — {h.name}</span>
+                  </span>
+                  {canManage && (
+                    <button type="button" onClick={() => handleDelete(h.id)} className="text-gray-400 hover:text-red-500">
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
 
 // Reexportado para não quebrar `import { linkifyText } from './App'` já em uso
 // (ex.: src/test/linkifyText.test.tsx). A implementação vive em ./lib/linkify
@@ -6338,13 +7404,34 @@ function ListView({
 
   const [expandedStatuses, setExpandedStatuses] = useState<string[]>([]);
 
+  // Cada grupo expandido monta uma <table> com todas as linhas daquele status
+  // (sem virtualização). Expandir tudo por padrão travava o navegador em
+  // escopos grandes (ex.: um espaço com ~6.000 tarefas tentava montar milhares
+  // de <tr> de uma vez). Acima do limiar, começa tudo fechado — o usuário
+  // ainda expande qualquer grupo com um clique, sem perder a funcionalidade.
+  const AUTO_EXPAND_TASK_LIMIT = 300;
   useEffect(() => {
-    if (JSON.stringify(expandedStatuses) !== JSON.stringify(statusOrder)) {
-      setExpandedStatuses(statusOrder);
+    const nextExpanded = tasks.length > AUTO_EXPAND_TASK_LIMIT ? [] : statusOrder;
+    if (JSON.stringify(expandedStatuses) !== JSON.stringify(nextExpanded)) {
+      setExpandedStatuses(nextExpanded);
     }
-  }, [statusOrder]);
+  }, [statusOrder, tasks.length]);
 
   const [expandedTasks, setExpandedTasks] = useState<Set<string>>(new Set());
+
+  // Cada linha renderizada monta subtarefas recursivas, editores de campo
+  // customizado e menus — cara demais pra montar tudo de um grupo grande de
+  // uma vez (ex.: 684 tarefas em "A Fazer" travava o navegador ao expandir).
+  // Em vez de virtualizar essa árvore recursiva (reescrita maior, sem rede de
+  // segurança de testes), cada grupo revela em lotes: só as primeiras
+  // VISIBLE_ROWS_STEP raízes desse status viram <tr>, com um botão "carregar
+  // mais" pro resto — mesmo efeito prático (nunca monta milhares de uma vez),
+  // risco bem menor.
+  const VISIBLE_ROWS_STEP = 200;
+  const [visibleRowsByStatus, setVisibleRowsByStatus] = useState<Record<string, number>>({});
+  const showMoreRows = useCallback((status: string, total: number) => {
+    setVisibleRowsByStatus((prev) => ({ ...prev, [status]: Math.min((prev[status] ?? VISIBLE_ROWS_STEP) + VISIBLE_ROWS_STEP, total) }));
+  }, []);
 
   const toggleStatus = useCallback((status: string) => {
     setExpandedStatuses((prev) => (prev.includes(status) ? prev.filter((s) => s !== status) : [...prev, status]));
@@ -6703,7 +7790,7 @@ function ListView({
                       </tr>
                     </thead>
                     <tbody className="divide-y">
-                      {statusTasks.flatMap((rootTask: Task) => {
+                      {statusTasks.slice(0, visibleRowsByStatus[status] ?? VISIBLE_ROWS_STEP).flatMap((rootTask: Task) => {
                         const renderRecursiveRows = (t: Task, depth: number = 0): React.ReactNode[] => {
                           if (depth >= 7) return [];
 
@@ -7004,6 +8091,15 @@ function ListView({
                     </tbody>
                   </table>
                 )}
+                {isExpanded && statusTasks.length > (visibleRowsByStatus[status] ?? VISIBLE_ROWS_STEP) && (
+                  <button
+                    type="button"
+                    onClick={() => showMoreRows(status, statusTasks.length)}
+                    className="w-full px-4 py-3 text-xs font-semibold text-gray-500 hover:bg-gray-50 border-t border-gray-100 transition-colors"
+                  >
+                    Carregar mais {Math.min(VISIBLE_ROWS_STEP, statusTasks.length - (visibleRowsByStatus[status] ?? VISIBLE_ROWS_STEP))} de {statusTasks.length - (visibleRowsByStatus[status] ?? VISIBLE_ROWS_STEP)} restantes
+                  </button>
+                )}
               </section>
             );
           })}
@@ -7290,11 +8386,15 @@ function KanbanView({ tasks, onSelectTask, onStatusChange, onQuickUpdateTask, on
   };
 
   const copyTaskLink = async (taskId: string) => {
-    // Preserva os params já presentes (ex: ?listId=, ?scope=) em vez de
+    // Preserva o path/params já presentes (ex: espaço/pasta atual) em vez de
     // descartá-los — sem isso, o link compartilhado perdia o contexto de
-    // lista/espaço de onde a tarefa foi aberta.
+    // onde a tarefa foi aberta. O sufixo /tarefa/<slug>-<id> troca (ou
+    // adiciona) só o final do path — ver withTaskPathSuffix.
+    const task = tasks.find(t => t.id === taskId);
     const url = new URL(window.location.href);
-    url.searchParams.set('taskId', taskId);
+    url.searchParams.delete('taskId');
+    url.pathname = withTaskPathSuffix(url.pathname, task);
+    if (!task) url.searchParams.set('taskId', taskId); // fallback: tarefa ainda não carregada localmente
     try {
       await navigator.clipboard.writeText(url.toString());
       toast.success('Link da tarefa copiado.');
@@ -7577,6 +8677,11 @@ function KanbanView({ tasks, onSelectTask, onStatusChange, onQuickUpdateTask, on
                             {task.dependencies?.some((d: any) => d.type === 'blocked_by') && (
                               <span title="Tarefa bloqueada" className="mt-0.5 shrink-0">
                                 <AlertTriangleIcon className="h-3 w-3 text-amber-400" />
+                              </span>
+                            )}
+                            {task.recurrenceRuleId && (
+                              <span title="Ocorrência de tarefa recorrente" className="mt-0.5 shrink-0">
+                                <Repeat className="h-3 w-3 text-blue-400" />
                               </span>
                             )}
                             {task.title}
@@ -8612,6 +9717,8 @@ function TaskDetailModal(props: any) {
     hiddenTaskFieldIdsByList,
     onDelete,
     onDuplicate,
+    onConfigureRecurrence,
+    recurrenceRule,
     tasks,
     onSelectTask,
     onQuickCreate,
@@ -9158,11 +10265,12 @@ function TaskDetailModal(props: any) {
           <div className="flex items-center gap-4">
             <button
               onClick={() => {
-                // Preserva os params já presentes (ex: ?listId=, ?scope=) em
-                // vez de descartá-los — sem isso, o link compartilhado perdia
-                // o contexto de lista/espaço de onde a tarefa foi aberta.
+                // Preserva o path/params já presentes — sem isso, o link
+                // compartilhado perdia o contexto de onde a tarefa foi
+                // aberta. Ver withTaskPathSuffix.
                 const url = new URL(window.location.href);
-                url.searchParams.set('taskId', task.id);
+                url.searchParams.delete('taskId');
+                url.pathname = withTaskPathSuffix(url.pathname, task);
                 navigator.clipboard.writeText(url.toString());
                 alert('Link da tarefa copiado!');
               }}
@@ -9178,6 +10286,24 @@ function TaskDetailModal(props: any) {
               >
                 <Copy className="w-4 h-4" /> Duplicar
               </button>
+            )}
+            {task.recurrenceRuleId ? (
+              <span
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-50 text-blue-600 text-xs font-semibold"
+                title="Esta tarefa foi gerada automaticamente por uma regra de recorrência"
+              >
+                <Repeat className="w-3.5 h-3.5" /> Ocorrência recorrente
+              </span>
+            ) : (
+              !isReadOnly && onConfigureRecurrence && (
+                <button
+                  onClick={onConfigureRecurrence}
+                  className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded-lg transition-all ${recurrenceRule ? (recurrenceRule.enabled ? 'bg-blue-50 text-blue-600' : 'bg-gray-100 text-gray-500') : 'hover:bg-blue-50 text-gray-500 hover:text-blue-600'}`}
+                  title="Configurar recorrência"
+                >
+                  <Repeat className="w-4 h-4" /> {recurrenceRule ? (recurrenceRule.enabled ? 'Recorrente' : 'Recorrência pausada') : 'Recorrência'}
+                </button>
+              )
             )}
             {!isReadOnly && onDelete && (
               <button onClick={onDelete} className="p-2 hover:bg-red-50 text-red-400 rounded-lg transition-colors" title="Excluir Tarefa">
@@ -9858,7 +10984,9 @@ function TaskDetailModal(props: any) {
                       'MAIN_RESPONSIBLE_CHANGE': 'bg-purple-50/30 border-purple-50 text-purple-600 circle-purple-400',
                       'RESPONSIBLE_ADDED': 'bg-green-50/30 border-green-50 text-green-600 circle-green-400',
                       'RESPONSIBLE_REMOVED': 'bg-red-50/30 border-red-50 text-red-600 circle-red-400',
-                      'TEAM_ASSIGNED': 'bg-purple-50/30 border-purple-50 text-purple-600 circle-purple-400'
+                      'TEAM_ASSIGNED': 'bg-purple-50/30 border-purple-50 text-purple-600 circle-purple-400',
+                      'TASK_DUPLICATED': 'bg-indigo-50/30 border-indigo-50 text-indigo-600 circle-indigo-400',
+                      'TASK_RECURRENCE_GENERATED': 'bg-indigo-50/30 border-indigo-50 text-indigo-600 circle-indigo-400'
                     };
 
                     const style = typeStyles[item.type] || 'bg-gray-50/30 border-gray-50 text-gray-600 circle-gray-400';
@@ -9869,10 +10997,16 @@ function TaskDetailModal(props: any) {
                         <div className={`absolute -left-[22px] top-1.5 w-2 h-2 rounded-full border-2 border-white shadow-sm ${circleClass.replace('circle-', 'bg-')}`}></div>
                         <div className={`text-xs leading-relaxed ${bgClass} p-3 rounded-2xl ml-2 border ${borderClass} shadow-sm transition-all hover:shadow-md`}>
                           <div className="flex items-center justify-between mb-1">
-                            <span className="font-bold text-gray-900">{users.find((u: any) => u.id === item.userId)?.name}</span>
+                            <span className="font-bold text-gray-900">{users.find((u: any) => u.id === item.userId)?.name || 'Recorrência automática'}</span>
                             <span className="text-[10px] text-gray-300">{formatDate(item.date)}</span>
                           </div>
                           <p className="text-gray-600 mt-1">
+                            {item.type === 'TASK_DUPLICATED' && (
+                              <>duplicou esta tarefa a partir de <span className={`font-bold ${textAccentClass}`}>{item.newValue}</span></>
+                            )}
+                            {item.type === 'TASK_RECURRENCE_GENERATED' && (
+                              <>tarefa gerada automaticamente pela recorrência de <span className={`font-bold ${textAccentClass}`}>{item.newValue}</span></>
+                            )}
                             {item.type === 'STATUS_CHANGE' && (
                               <>alterou o status para <span className={`font-bold ${textAccentClass}`}>{item.newValue}</span></>
                             )}

@@ -12,7 +12,7 @@
 // sub-entidades), duplicação, dashboard e ações em massa. A orquestração e as
 // regras de negócio continuam no App (viram um TaskService na Fase 2).
 import { supabase } from './supabase';
-import { CustomFieldValue, Task, TaskPriority } from '../types';
+import { CustomFieldValue, Task, TaskPriority, TaskRecurrenceRule } from '../types';
 
 const PAGE_SIZE = 1000;
 export const INITIAL_TASK_PAGE_SIZE = 100;
@@ -38,6 +38,10 @@ const TASK_ROW_SELECT = [
   'created_by',
   'tags',
   'is_milestone',
+  'recurrence_rule_id',
+  'recurrence_parent_task_id',
+  'recurrence_sequence',
+  'scheduled_occurrence_at',
 ].join(',');
 
 // ── Formato cru das linhas do banco (snake_case) ────────────────────────────
@@ -59,6 +63,10 @@ export interface TaskRow {
   created_by: string | null;
   tags: string[] | null;
   is_milestone: boolean | null;
+  recurrence_rule_id: string | null;
+  recurrence_parent_task_id: string | null;
+  recurrence_sequence: number | null;
+  scheduled_occurrence_at: string | null;
 }
 interface AttachmentRow { id: string; task_id: string; name: string; url: string; type: string; size: number; uploaded_at: string; }
 interface CommentRow {
@@ -136,6 +144,10 @@ const mapTaskCore = (d: TaskRow) => ({
   createdBy: d.created_by || undefined,
   tags: d.tags || [],
   isMilestone: d.is_milestone ?? false,
+  recurrenceRuleId: d.recurrence_rule_id || undefined,
+  recurrenceParentTaskId: d.recurrence_parent_task_id || undefined,
+  recurrenceSequence: d.recurrence_sequence ?? undefined,
+  scheduledOccurrenceAt: d.scheduled_occurrence_at || undefined,
 });
 
 // Task "shell": campos preenchidos, sub-entidades vazias. Usado nas listagens,
@@ -154,11 +166,44 @@ export function mapRowToTaskShell(d: TaskRow): Task {
 }
 
 // Paginação genérica: busca todas as páginas de `build` até esgotar.
+//
+// Com `countQuery`: pede a contagem exata primeiro (uma consulta leve, sem
+// linhas — `head: true`) e, sabendo o total, dispara TODAS as páginas de
+// dados em paralelo via Promise.all, em vez de uma atrás da outra. Sem isso,
+// um escopo grande (ex.: pasta com ~3400 tarefas = 4 páginas de 1000) somava
+// a latência de cada página em série — ~16s observados em produção pra essa
+// pasta específica (achado em 2026-09-06, /equipamentos/02-projeto-em-
+// andamento). Se a contagem falhar por qualquer motivo, cai pro loop
+// sequencial de sempre — nunca fica sem dado por causa dessa otimização.
 async function fetchAllPages<T>(
   build: (from: number, to: number) => PromiseLike<PostgrestResult<T>>,
   label: string,
   startFrom = 0,
+  countQuery?: () => PromiseLike<{ count: number | null; error: unknown }>,
 ): Promise<T[]> {
+  if (countQuery) {
+    try {
+      const { count, error: countError } = await countQuery();
+      if (!countError && typeof count === 'number') {
+        if (count <= startFrom) return [];
+        const pageStarts: number[] = [];
+        for (let from = startFrom; from < count; from += PAGE_SIZE) pageStarts.push(from);
+        const pages = await Promise.all(pageStarts.map((from) => build(from, from + PAGE_SIZE - 1)));
+        const all: T[] = [];
+        for (const { data: page, error } of pages) {
+          if (error) {
+            console.error(`taskRepo.${label}: erro ao paginar (paralelo):`, error);
+            throw error;
+          }
+          if (page) all.push(...page);
+        }
+        return all;
+      }
+    } catch (err) {
+      console.error(`taskRepo.${label}: contagem falhou, caindo para paginação sequencial:`, err);
+    }
+  }
+
   let all: T[] = [];
   let from = startFrom;
   while (true) {
@@ -230,6 +275,12 @@ export function fetchTaskRowsByListIds(listIds: string[] | null): Promise<TaskRo
         .range(from, to);
     },
     'fetchTaskRowsByListIds',
+    0,
+    async () => {
+      const q = supabase.from('tasks').select('id', { count: 'exact', head: true });
+      const { count, error } = await (listIds ? q.in('list_id', listIds) : q);
+      return { count, error };
+    },
   );
 }
 
@@ -248,6 +299,11 @@ export function fetchRemainingTaskRowsByListIds(listIds: string[] | null): Promi
     },
     'fetchRemainingTaskRowsByListIds',
     INITIAL_TASK_PAGE_SIZE,
+    async () => {
+      const q = supabase.from('tasks').select('id', { count: 'exact', head: true });
+      const { count, error } = await (listIds ? q.in('list_id', listIds) : q);
+      return { count, error };
+    },
   );
 }
 
@@ -263,6 +319,14 @@ export function fetchTaskRowsByListId(listId: string): Promise<TaskRow[]> {
       .order('id', { ascending: true })
       .range(from, to),
     'fetchTaskRowsByListId',
+    0,
+    async () => {
+      const { count, error } = await supabase
+        .from('tasks')
+        .select('id', { count: 'exact', head: true })
+        .eq('list_id', listId);
+      return { count, error };
+    },
   );
 }
 
@@ -281,6 +345,13 @@ export function fetchRemainingTaskRowsByListId(listId: string): Promise<TaskRow[
       .range(from, to),
     'fetchRemainingTaskRowsByListId',
     INITIAL_TASK_PAGE_SIZE,
+    async () => {
+      const { count, error } = await supabase
+        .from('tasks')
+        .select('id', { count: 'exact', head: true })
+        .eq('list_id', listId);
+      return { count, error };
+    },
   );
 }
 
@@ -382,9 +453,13 @@ export async function fetchCustomFieldValuesByEntityIds(entityIds: string[]): Pr
   const uniqueIds = Array.from(new Set(entityIds.filter(Boolean)));
   if (uniqueIds.length === 0) return [];
 
-  const rows: CustomFieldValueRow[] = [];
+  // Mesmo motivo do fetchSubEntityInChunks: lotes são requisições
+  // independentes, então disparamos em paralelo em vez de um atrás do outro.
+  const chunks: string[][] = [];
   for (let i = 0; i < uniqueIds.length; i += SUBENTITY_CHUNK) {
-    const slice = uniqueIds.slice(i, i + SUBENTITY_CHUNK);
+    chunks.push(uniqueIds.slice(i, i + SUBENTITY_CHUNK));
+  }
+  const chunkResults = await Promise.all(chunks.map(async (slice) => {
     const { data, error } = await supabase
       .from('custom_field_values')
       .select('field_id, entity_id, value')
@@ -392,10 +467,11 @@ export async function fetchCustomFieldValuesByEntityIds(entityIds: string[]): Pr
 
     if (error) {
       console.error('taskRepo.fetchCustomFieldValuesByEntityIds: erro ao carregar lote:', error);
-      continue;
+      return [];
     }
-    if (data) rows.push(...(data as CustomFieldValueRow[]));
-  }
+    return (data as CustomFieldValueRow[]) ?? [];
+  }));
+  const rows: CustomFieldValueRow[] = chunkResults.flat();
 
   return rows.map((v) => ({
     fieldId: v.field_id,
@@ -427,24 +503,32 @@ export async function searchTaskRowsByTitle(term: string, limit = 200): Promise<
   return (data || []) as TaskRow[];
 }
 
-// Busca uma sub-entidade filtrando por task_id em lotes seguros de IDs.
+// Busca uma sub-entidade filtrando por task_id em lotes seguros de IDs. Os
+// lotes são requisições independentes (o corte de 150 é só pra manter a URL
+// dentro do limite, ver SUBENTITY_CHUNK) — disparar todos em paralelo em vez
+// de um atrás do outro evita somar a latência de cada round-trip em série
+// (ex.: uma pasta com ~3400 tarefas gera ~23 lotes; em série isso passava de
+// meio minuto só nessa sub-entidade, achado em produção com /equipamentos/
+// 02-projeto-em-andamento em 2026-09-06).
 async function fetchSubEntityInChunks<T>(
   taskIds: string[],
   build: (ids: string[]) => PromiseLike<PostgrestResult<T>>,
   label: string,
 ): Promise<T[]> {
-  const out: T[] = [];
+  const chunks: string[][] = [];
   for (let i = 0; i < taskIds.length; i += SUBENTITY_CHUNK) {
     const slice = taskIds.slice(i, i + SUBENTITY_CHUNK);
-    if (slice.length === 0) continue;
+    if (slice.length > 0) chunks.push(slice);
+  }
+  const results = await Promise.all(chunks.map(async (slice, idx) => {
     const { data: part, error } = await build(slice);
     if (error) {
-      console.error(`taskRepo.hydrateTaskRows: erro ao carregar ${label} (lote ${i / SUBENTITY_CHUNK}):`, error);
-      continue;
+      console.error(`taskRepo.hydrateTaskRows: erro ao carregar ${label} (lote ${idx}):`, error);
+      return [];
     }
-    if (part) out.push(...part);
-  }
-  return out;
+    return part ?? [];
+  }));
+  return results.flat();
 }
 
 // Hidrata linhas de `tasks` em objetos Task completos, buscando as
@@ -869,6 +953,167 @@ export async function insertTaskClone(input: TaskCloneInput): Promise<{ task: Ta
   };
 }
 
+// ── Regra de recorrência (issue #184, fase 3 — UI de configuração) ─────────
+// RLS já garante acesso (task_recurrence_rules_select/ins/upd/del usam
+// can_access_task/can_access_list, ver migration da fase 1) — sem
+// auto-referência na policy de SELECT, então .insert().select() é seguro
+// aqui (diferente de tasks/lists/folders, que precisaram de id-no-cliente).
+interface RecurrenceRuleRow {
+  id: string;
+  task_id: string;
+  list_id: string;
+  created_by: string | null;
+  enabled: boolean;
+  frequency_type: string;
+  interval: number;
+  weekdays: number[];
+  month_day: number | null;
+  month_week: number | null;
+  month_weekday: number | null;
+  start_at: string;
+  next_run_at: string | null;
+  timezone: string;
+  trigger_mode: string;
+  days_after_complete: number | null;
+  create_new_task: boolean;
+  skip_weekends: boolean;
+  skip_holidays: boolean;
+  weekend_shift: string;
+  end_mode: string;
+  end_at: string | null;
+  max_occurrences: number | null;
+  occurrences_created: number;
+  update_status_to: string | null;
+  inherit_options: Record<string, boolean>;
+  overlap_policy: string;
+  misfire_policy: string;
+  last_generated_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function mapRecurrenceRuleRow(r: RecurrenceRuleRow): TaskRecurrenceRule {
+  return {
+    id: r.id,
+    taskId: r.task_id,
+    listId: r.list_id,
+    createdBy: r.created_by ?? undefined,
+    enabled: r.enabled,
+    frequencyType: r.frequency_type as TaskRecurrenceRule['frequencyType'],
+    interval: r.interval,
+    weekdays: r.weekdays || [],
+    monthDay: r.month_day ?? undefined,
+    monthWeek: r.month_week ?? undefined,
+    monthWeekday: r.month_weekday ?? undefined,
+    startAt: r.start_at,
+    nextRunAt: r.next_run_at ?? undefined,
+    timezone: r.timezone,
+    triggerMode: r.trigger_mode as TaskRecurrenceRule['triggerMode'],
+    daysAfterComplete: r.days_after_complete ?? undefined,
+    createNewTask: r.create_new_task,
+    skipWeekends: r.skip_weekends,
+    skipHolidays: r.skip_holidays,
+    weekendShift: r.weekend_shift as TaskRecurrenceRule['weekendShift'],
+    endMode: r.end_mode as TaskRecurrenceRule['endMode'],
+    endAt: r.end_at ?? undefined,
+    maxOccurrences: r.max_occurrences ?? undefined,
+    occurrencesCreated: r.occurrences_created,
+    updateStatusTo: r.update_status_to ?? undefined,
+    inheritOptions: r.inherit_options || {},
+    overlapPolicy: r.overlap_policy as TaskRecurrenceRule['overlapPolicy'],
+    misfirePolicy: r.misfire_policy as TaskRecurrenceRule['misfirePolicy'],
+    lastGeneratedAt: r.last_generated_at ?? undefined,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+export async function fetchRecurrenceRuleForTask(taskId: string): Promise<TaskRecurrenceRule | null> {
+  const { data, error } = await supabase
+    .from('task_recurrence_rules')
+    .select('*')
+    .eq('task_id', taskId)
+    .maybeSingle();
+  if (error || !data) return null;
+  return mapRecurrenceRuleRow(data as RecurrenceRuleRow);
+}
+
+export interface RecurrenceRuleInput {
+  taskId: string;
+  listId: string;
+  createdBy: string;
+  frequencyType: TaskRecurrenceRule['frequencyType'];
+  interval: number;
+  weekdays: number[];
+  monthDay?: number | null;
+  monthWeek?: number | null;
+  monthWeekday?: number | null;
+  startAt: string;
+  nextRunAt: string | null;
+  timezone: string;
+  skipWeekends: boolean;
+  skipHolidays: boolean;
+  weekendShift: TaskRecurrenceRule['weekendShift'];
+  endMode: TaskRecurrenceRule['endMode'];
+  endAt?: string | null;
+  maxOccurrences?: number | null;
+  inheritOptions: TaskRecurrenceRule['inheritOptions'];
+  overlapPolicy: TaskRecurrenceRule['overlapPolicy'];
+  misfirePolicy: TaskRecurrenceRule['misfirePolicy'];
+}
+
+// Cria ou substitui a regra de recorrência da tarefa (uma tarefa tem no
+// máximo uma regra — upsert por task_id). Reseta occurrences_created/
+// last_generated_at ao recriar porque muda os parâmetros do zero.
+export async function upsertRecurrenceRule(
+  input: RecurrenceRuleInput,
+  existingRuleId: string | null,
+): Promise<{ rule: TaskRecurrenceRule } | { error: string }> {
+  const payload = {
+    task_id: input.taskId,
+    list_id: input.listId,
+    created_by: input.createdBy,
+    enabled: true,
+    frequency_type: input.frequencyType,
+    interval: input.interval,
+    weekdays: input.weekdays,
+    month_day: input.monthDay ?? null,
+    month_week: input.monthWeek ?? null,
+    month_weekday: input.monthWeekday ?? null,
+    start_at: input.startAt,
+    next_run_at: input.nextRunAt,
+    timezone: input.timezone,
+    trigger_mode: 'on_schedule',
+    skip_weekends: input.skipWeekends,
+    skip_holidays: input.skipHolidays,
+    weekend_shift: input.weekendShift,
+    end_mode: input.endMode,
+    end_at: input.endAt ?? null,
+    max_occurrences: input.maxOccurrences ?? null,
+    inherit_options: input.inheritOptions,
+    overlap_policy: input.overlapPolicy,
+    misfire_policy: input.misfirePolicy,
+  };
+
+  const query = existingRuleId
+    ? supabase.from('task_recurrence_rules').update(payload).eq('id', existingRuleId)
+    : supabase.from('task_recurrence_rules').insert(payload);
+
+  const { data, error } = await query.select('*').single();
+  if (error || !data) return { error: error?.message ?? 'Falha ao salvar a regra de recorrência.' };
+  return { rule: mapRecurrenceRuleRow(data as RecurrenceRuleRow) };
+}
+
+export async function setRecurrenceRuleEnabled(ruleId: string, enabled: boolean): Promise<{ error: string | null }> {
+  const { error } = await supabase.from('task_recurrence_rules').update({ enabled }).eq('id', ruleId);
+  return { error: error?.message ?? null };
+}
+
+export async function deleteRecurrenceRule(ruleId: string): Promise<{ error: string | null }> {
+  const { error } = await supabase.from('task_recurrence_rules').delete().eq('id', ruleId);
+  return { error: error?.message ?? null };
+}
+
 // Copia os checklists de uma tarefa para outra. Devolve os itens já mapeados
 // (ou lista vazia se a origem não tiver checklists).
 export async function copyChecklists(
@@ -895,21 +1140,20 @@ interface DashboardRow {
   extension_count: number | null; list_id: string | null; created_at: string;
 }
 
-// Carrega os dados do Dashboard: tarefas (projeção enxuta, paginadas) com as
-// atividades recentes já anexadas, mais a lista de listas para os rótulos.
-export async function fetchDashboardData(): Promise<{ tasks: Task[]; lists: { id: string; name: string }[] }> {
-  const rows = await fetchAllPages<DashboardRow>(
-    (from, to) => supabase
-      .from('tasks')
-      .select('id, title, status, priority, main_assignee_id, start_date, due_date, extension_count, list_id, created_at')
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: true })
-      .range(from, to),
-    'fetchDashboardData',
-  );
-  if (rows.length === 0) return { tasks: [], lists: [] };
+// Carrega os dados do Dashboard: só as tarefas por trás de "Atividade
+// Recente" (os widgets agregados vêm de fetchDashboardSummary/RPC) + a lista
+// de listas para os rótulos.
+// Antes isso paginava a tabela `tasks` INTEIRA (fetchAllPages) só pra achar
+// as poucas tarefas citadas nas 200 atividades recentes — ~9 páginas de
+// ~3-4s cada num workspace com 8 mil tarefas (30s+ medido ao vivo pra ADMIN,
+// que não tem filtro de lista pra reduzir o total). As atividades JÁ dizem
+// exatamente quais tarefas aparecem no widget: busca essas ≤200 tarefas por
+// id em vez de escanear tudo — rápido independente do tamanho do workspace.
+// `listIds` vira só um filtro extra defensivo (RLS já protege de qualquer
+// forma); `null` = sem filtro adicional (ADMIN).
+export async function fetchDashboardData(listIds: string[] | null): Promise<{ tasks: Task[]; lists: { id: string; name: string }[] }> {
+  if (listIds !== null && listIds.length === 0) return { tasks: [], lists: [] };
 
-  // Atividades + listas em paralelo (evita IN com milhares de IDs).
   const [actResult, listsResult] = await Promise.all([
     supabase
       .from('task_activities')
@@ -919,8 +1163,25 @@ export async function fetchDashboardData(): Promise<{ tasks: Task[]; lists: { id
     supabase.from('lists').select('id,name'),
   ]);
 
+  const activities = (actResult.data || []) as ActivityRow[];
+  const taskIds = Array.from(new Set(activities.map((a) => a.task_id)));
+  if (taskIds.length === 0) return { tasks: [], lists: (listsResult.data || []) as { id: string; name: string }[] };
+
+  let taskQuery = supabase
+    .from('tasks')
+    .select('id, title, status, priority, main_assignee_id, start_date, due_date, extension_count, list_id, created_at')
+    .in('id', taskIds);
+  if (listIds) taskQuery = taskQuery.in('list_id', listIds);
+  const { data: rowsData, error } = await taskQuery;
+  if (error) {
+    console.error('taskRepo.fetchDashboardData: erro ao carregar tarefas:', error);
+    throw error;
+  }
+  const rows = (rowsData || []) as DashboardRow[];
+  if (rows.length === 0) return { tasks: [], lists: (listsResult.data || []) as { id: string; name: string }[] };
+
   const actMap = new Map<string, ActivityRow[]>();
-  ((actResult.data || []) as ActivityRow[]).forEach((a) => {
+  activities.forEach((a) => {
     if (!actMap.has(a.task_id)) actMap.set(a.task_id, []);
     actMap.get(a.task_id)!.push(a);
   });
