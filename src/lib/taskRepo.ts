@@ -895,33 +895,20 @@ interface DashboardRow {
   extension_count: number | null; list_id: string | null; created_at: string;
 }
 
-// Carrega os dados do Dashboard: tarefas (projeção enxuta, paginadas) com as
-// atividades recentes já anexadas, mais a lista de listas para os rótulos.
-// Filtra por `listIds` (listas acessíveis ao usuário, já restritas pela RLS em
-// `lists`): sem esse filtro, o Postgres varre a tabela `tasks` inteira
-// avaliando a política de RLS linha a linha antes do LIMIT — 3-8s por
-// chamada em produção (visto em pg_stat_statements) e cresce com o volume
-// total de tarefas, não com o que o usuário realmente vê. `listIds === null`
-// pula o filtro (mesma convenção de fetchTaskRowsByListIds): para ADMIN, que
-// já enxerga todas as listas, o `.in()` com centenas de IDs só soma overhead
-// sem eliminar nenhuma linha (medido: ~40% mais lento por página, sem ganho).
+// Carrega os dados do Dashboard: só as tarefas por trás de "Atividade
+// Recente" (os widgets agregados vêm de fetchDashboardSummary/RPC) + a lista
+// de listas para os rótulos.
+// Antes isso paginava a tabela `tasks` INTEIRA (fetchAllPages) só pra achar
+// as poucas tarefas citadas nas 200 atividades recentes — ~9 páginas de
+// ~3-4s cada num workspace com 8 mil tarefas (30s+ medido ao vivo pra ADMIN,
+// que não tem filtro de lista pra reduzir o total). As atividades JÁ dizem
+// exatamente quais tarefas aparecem no widget: busca essas ≤200 tarefas por
+// id em vez de escanear tudo — rápido independente do tamanho do workspace.
+// `listIds` vira só um filtro extra defensivo (RLS já protege de qualquer
+// forma); `null` = sem filtro adicional (ADMIN).
 export async function fetchDashboardData(listIds: string[] | null): Promise<{ tasks: Task[]; lists: { id: string; name: string }[] }> {
   if (listIds !== null && listIds.length === 0) return { tasks: [], lists: [] };
-  const rows = await fetchAllPages<DashboardRow>(
-    (from, to) => {
-      const q = supabase
-        .from('tasks')
-        .select('id, title, status, priority, main_assignee_id, start_date, due_date, extension_count, list_id, created_at');
-      return (listIds ? q.in('list_id', listIds) : q)
-        .order('created_at', { ascending: false })
-        .order('id', { ascending: true })
-        .range(from, to);
-    },
-    'fetchDashboardData',
-  );
-  if (rows.length === 0) return { tasks: [], lists: [] };
 
-  // Atividades + listas em paralelo (evita IN com milhares de IDs).
   const [actResult, listsResult] = await Promise.all([
     supabase
       .from('task_activities')
@@ -931,8 +918,25 @@ export async function fetchDashboardData(listIds: string[] | null): Promise<{ ta
     supabase.from('lists').select('id,name'),
   ]);
 
+  const activities = (actResult.data || []) as ActivityRow[];
+  const taskIds = Array.from(new Set(activities.map((a) => a.task_id)));
+  if (taskIds.length === 0) return { tasks: [], lists: (listsResult.data || []) as { id: string; name: string }[] };
+
+  let taskQuery = supabase
+    .from('tasks')
+    .select('id, title, status, priority, main_assignee_id, start_date, due_date, extension_count, list_id, created_at')
+    .in('id', taskIds);
+  if (listIds) taskQuery = taskQuery.in('list_id', listIds);
+  const { data: rowsData, error } = await taskQuery;
+  if (error) {
+    console.error('taskRepo.fetchDashboardData: erro ao carregar tarefas:', error);
+    throw error;
+  }
+  const rows = (rowsData || []) as DashboardRow[];
+  if (rows.length === 0) return { tasks: [], lists: (listsResult.data || []) as { id: string; name: string }[] };
+
   const actMap = new Map<string, ActivityRow[]>();
-  ((actResult.data || []) as ActivityRow[]).forEach((a) => {
+  activities.forEach((a) => {
     if (!actMap.has(a.task_id)) actMap.set(a.task_id, []);
     actMap.get(a.task_id)!.push(a);
   });
