@@ -80,10 +80,17 @@ jobs:
           $SCP -r dist/. "$SSH_USER@$SSH_HOST:$STAGING_DIR/"
           $SSH "if [ -d '$LIVE_DIR' ]; then mv '$LIVE_DIR' '$PREV_DIR'; fi && mv '$STAGING_DIR' '$LIVE_DIR'"
 
-          # Sobe (ou garante no ar) o container — bind mount já reflete o
-          # conteúdo novo sem precisar de restart, mas `up -d` garante que o
-          # serviço exista na primeira execução.
-          $SSH "cd '$REMOTE_BASE' && docker compose up -d"
+          # Sobe (ou garante no ar) o container — `up -d` garante que o
+          # serviço exista na primeira execução. Diferente da hospedagem
+          # compartilhada antiga (deploy.yml), aqui o nginx roda DENTRO de um
+          # container com bind mount pra "dist": o `mv` acima troca o
+          # diretório por nome, mas o mount do container continua preso ao
+          # inode antigo (renomeado pra dist_prev) até o container reiniciar
+          # — sem o restart, o site fica servindo o build anterior
+          # silenciosamente (confirmado em produção em 2026-09-06: o deploy
+          # passou verde com o build antigo ainda no ar). `restart` reabre o
+          # bind mount contra o "dist" atual.
+          $SSH "cd '$REMOTE_BASE' && docker compose up -d && docker compose restart"
 
           rm -f deploy_key
           echo 'Deploy enviado para a VPS (vpclick.vpsistema.com).'
@@ -92,6 +99,21 @@ jobs:
         run: |
           set -e
           SITE='https://vpclick.vpsistema.com'
+
+          # Checa PRIMEIRO se o commit servido é o que este run acabou de
+          # buildar — sem isso, o resto desta verificação pode passar verde
+          # mesmo servindo um build antigo (achado em produção 2026-09-06:
+          # bind mount do container ficava preso no diretório antigo depois
+          # do swap atômico, e o index.html antigo referenciava assets
+          # antigos que ainda existiam em disco, então tudo "batia").
+          echo "Conferindo se o commit publicado é $GITHUB_SHA..."
+          PUBLISHED_COMMIT=$(curl --http1.1 --retry 5 --retry-delay 3 --retry-all-errors -fsS "$SITE/version.json?cachebust=$GITHUB_RUN_ID" | grep -o '"commit": *"[^"]*"' | sed 's/.*"\([a-f0-9]*\)"/\1/')
+          if [ "$PUBLISHED_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "❌ Servidor está com o commit $PUBLISHED_COMMIT, esperado $GITHUB_SHA — o container não pegou o build novo (tente 'docker compose restart' na VPS)."
+            exit 1
+          fi
+          echo "✅ Commit publicado confere."
+
           echo "Buscando $SITE/index.html publicado..."
           curl --http1.1 --retry 5 --retry-delay 3 --retry-all-errors -fsS -H 'Cache-Control: no-cache' "$SITE/?cachebust=$GITHUB_RUN_ID" -o published.html
 
