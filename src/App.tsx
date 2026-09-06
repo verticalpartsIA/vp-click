@@ -16,7 +16,7 @@ import CreateListModal from './components/CreateListModal';
 import compactLogoWhite from './assets/logo-verticalparts-white.png';
 import bootLogoVideo from './assets/logo-limpo-video.mp4';
 import { recordRecentTaskId } from './lib/recentTasks';
-import { buildSlugIndex, type SlugIndex } from './lib/slug';
+import { buildSlugIndex, slugify, type SlugIndex } from './lib/slug';
 import { lazyImportWithReload, clearChunkReloadFlag } from './lib/lazyRetry';
 import { supabase } from './lib/supabase';
 import * as taskRepo from './lib/taskRepo';
@@ -182,7 +182,32 @@ interface ParsedNav {
   scopeId: string | null;
   scopeName: string;
   mine: boolean;
+  // Id completo — só quando veio do formato legado `?taskId=<uuid>` (já
+  // resolvido, não depende de `tasks` estar carregado).
   taskId: string | null;
+  // 8 primeiros chars do id — quando veio do path novo (.../tarefa/<slug>-
+  // <8chars>). Precisa ser resolvido contra `tasks` já carregado pra virar
+  // um `selectedTaskId` de verdade (ver `pendingTaskSlugId` no componente).
+  taskSlugId: string | null;
+}
+
+// Segmento fixo que marca "o que vem depois é uma tarefa aberta" na URL,
+// sempre no FINAL do path (depois de espaço/pasta/lista/view, se houver):
+// .../tarefa/<slug-do-titulo>-<8-chars-do-id>. Os 8 chars (não o título)
+// são a fonte da verdade — o título é só cosmético e pode ficar desatualizado
+// se a tarefa for renomeada depois; o link continua funcionando.
+const TASK_PATH_SEGMENT = 'tarefa';
+const TASK_SLUG_ID_RE = /-([0-9a-f]{8})$/;
+
+// Remove o `/tarefa/<slug>-<id>` do FINAL do path, se houver, devolvendo os
+// segmentos restantes (pra parsear escopo/view normalmente) + o id curto.
+function stripTaskSlugSegment(segments: string[]): { rest: string[]; taskSlugId: string | null } {
+  if (segments.length < 2 || segments[segments.length - 2] !== TASK_PATH_SEGMENT) {
+    return { rest: segments, taskSlugId: null };
+  }
+  const match = segments[segments.length - 1].match(TASK_SLUG_ID_RE);
+  if (!match) return { rest: segments, taskSlugId: null };
+  return { rest: segments.slice(0, -2), taskSlugId: match[1] };
 }
 
 // Índices slug<->id de espaços/pastas/listas, usados por parseNavPath (URL →
@@ -203,11 +228,14 @@ interface NavSlugMaps {
 // URL → estado de navegação. Usada tanto na carga inicial (deep link/refresh)
 // quanto quando o usuário navega pelo botão voltar/avançar do navegador.
 function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): ParsedNav {
-  const segments = pathname.split('/').filter(Boolean);
+  const rawSegments = pathname.split('/').filter(Boolean);
+  const { rest: segments, taskSlugId } = stripTaskSlugSegment(rawSegments);
   const params = new URLSearchParams(search);
+  // `?taskId=` legado tem prioridade — já é um id completo e resolvido, não
+  // depende de `tasks` estar carregado (ver taskSlugId, que sim depende).
   const taskId = params.get('taskId');
   if (segments[0] === 'doc') {
-    return { view: 'Doc', docId: segments[1] || null, listId: null, scopeType: 'global', scopeId: null, scopeName: '', mine: false, taskId };
+    return { view: 'Doc', docId: segments[1] || null, listId: null, scopeType: 'global', scopeId: null, scopeName: '', mine: false, taskId, taskSlugId: taskId ? null : taskSlugId };
   }
 
   // Primeiro segmento bate com uma view conhecida (ou path vazio = raiz) →
@@ -235,6 +263,7 @@ function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): 
       scopeName,
       mine: WORKSPACE_VIEWS.includes(view) && mine,
       taskId,
+      taskSlugId: taskId ? null : taskSlugId,
     };
   }
 
@@ -246,7 +275,7 @@ function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): 
   const spaceId = slugMaps.spaceIndex.slugToId.get(` ${segments[0]}`);
   const space = spaceId ? slugMaps.spaces.find(s => s.id === spaceId) : undefined;
   if (!space) {
-    return { view: 'Dashboard', docId: null, listId: null, scopeType: 'global', scopeId: null, scopeName: 'Dashboard', mine: false, taskId };
+    return { view: 'Dashboard', docId: null, listId: null, scopeType: 'global', scopeId: null, scopeName: 'Dashboard', mine: false, taskId, taskSlugId: taskId ? null : taskSlugId };
   }
 
   // O último segmento pode ser a view (list/kanban/calendar/gantt/table/
@@ -295,7 +324,7 @@ function parseNavPath(pathname: string, search: string, slugMaps: NavSlugMaps): 
   const scopeType: ScopeType = listId ? 'global' : folderId ? 'folder' : 'space';
   const scopeId = listId ? null : folderId ?? space.id;
   const scopeName = listId ? '' : folderId ? folderName : space.name;
-  return { view, docId: null, listId, scopeType, scopeId, scopeName, mine: false, taskId };
+  return { view, docId: null, listId, scopeType, scopeId, scopeName, mine: false, taskId, taskSlugId: taskId ? null : taskSlugId };
 }
 
 // Estado de navegação → URL. `currentSearch` carrega params que não são de
@@ -305,6 +334,7 @@ function computeNavPath(
   state: { activeView: ActiveView; activeListId: string | null; activeScope: NavigationScope; activeDocId: string | null; selectedTaskId: string | null },
   currentSearch: string,
   slugMaps: NavSlugMaps,
+  tasksForTaskSlug: Pick<Task, 'id' | 'title'>[],
 ): string {
   const params = new URLSearchParams(currentSearch);
   params.delete('listId');
@@ -312,12 +342,25 @@ function computeNavPath(
   params.delete('scopeId');
   params.delete('mine');
   params.delete('view');
+  params.delete('taskId');
 
+  // Tarefa aberta vira `/tarefa/<slug-do-título>-<8-chars-do-id>` no FINAL
+  // do path (depois de escopo/view, se houver) — só os 8 chars do id são a
+  // fonte da verdade na hora de resolver de volta (ver parseNavPath), o
+  // título é cosmético e pode ficar desatualizado sem quebrar o link. Cai de
+  // volta pro `?taskId=` legado só se a tarefa ainda não estiver em `tasks`
+  // (não deveria acontecer: só chegamos aqui com selectedTaskId já
+  // confirmado presente).
+  let taskPathSuffix = '';
   if (state.selectedTaskId) {
-    params.set('taskId', state.selectedTaskId);
+    const task = tasksForTaskSlug.find(t => t.id === state.selectedTaskId);
+    if (task) {
+      taskPathSuffix = `/${TASK_PATH_SEGMENT}/${slugify(task.title)}-${task.id.slice(0, 8)}`;
+    } else {
+      params.set('taskId', state.selectedTaskId);
+    }
   } else {
     // Sem tarefa selecionada, `tab` (do modal fechado) também não faz sentido.
-    params.delete('taskId');
     params.delete('tab');
   }
 
@@ -330,13 +373,14 @@ function computeNavPath(
 
   if (state.activeView === 'Doc') {
     const search = params.toString();
-    return `/doc${state.activeDocId ? `/${state.activeDocId}` : ''}${search ? `?${search}` : ''}`;
+    return `/doc${state.activeDocId ? `/${state.activeDocId}` : ''}${taskPathSuffix}${search ? `?${search}` : ''}`;
   }
 
   if (!WORKSPACE_VIEWS.includes(state.activeView)) {
     const slug = VIEW_TO_SLUG[state.activeView] ?? '';
+    const base = slug ? `/${slug}` : '/';
     const search = params.toString();
-    return `${slug ? `/${slug}` : '/'}${search ? `?${search}` : ''}`;
+    return `${base}${taskPathSuffix}${search ? `?${search}` : ''}`;
   }
 
   // Tenta montar o path legível (/<space>[/<folder>[/<list>]]). Sem espaço
@@ -379,7 +423,7 @@ function computeNavPath(
       pathParts.push(VIEW_TO_SLUG[state.activeView] || 'dashboard');
     }
     const search = params.toString();
-    return `/${pathParts.join('/')}${search ? `?${search}` : ''}`;
+    return `/${pathParts.join('/')}${taskPathSuffix}${search ? `?${search}` : ''}`;
   }
 
   // Fallback legado: escopo ainda não resolvível em slug (índices vazios,
@@ -397,7 +441,19 @@ function computeNavPath(
     params.set('mine', '1');
   }
   const search = params.toString();
-  return `${slug ? `/${slug}` : '/'}${search ? `?${search}` : ''}`;
+  return `${slug ? `/${slug}` : '/'}${taskPathSuffix}${search ? `?${search}` : ''}`;
+}
+
+// Troca (ou adiciona) o sufixo `/tarefa/<slug>-<id>` no final de um pathname
+// — usado pelos botões "Compartilhar"/"Copiar link", que herdam o path da
+// página atual (espaço/pasta/lista/view) mas podem apontar pra uma tarefa
+// diferente da que está aberta ali (ex.: menu de contexto numa linha da
+// lista). Sem `task` carregado (raro — id vindo de fora do `tasks` atual),
+// só limpa um sufixo antigo e deixa o chamador decidir o fallback.
+function withTaskPathSuffix(pathname: string, task: { id: string; title: string } | undefined): string {
+  const base = pathname.replace(new RegExp(`/${TASK_PATH_SEGMENT}/[^/]+$`), '');
+  if (!task) return base;
+  return `${base}/${TASK_PATH_SEGMENT}/${slugify(task.title)}-${task.id.slice(0, 8)}`;
 }
 
 type DuplicateTaskBooleanOption = Exclude<keyof DuplicateTaskOptions, 'title' | 'listId'>;
@@ -1408,6 +1464,15 @@ export default function App() {
   // qualquer URL de escopo (/suprimentos/importacao) cai no fallback global
   // até esse flag virar true (ver efeito de entrada, mais abaixo).
   const [workspaceMetaLoaded, setWorkspaceMetaLoaded] = useState(false);
+  // `true` depois que a URL foi resolvida contra os dados reais pelo menos
+  // uma vez (ver efeito de entrada/saída, mais abaixo). Também usada por
+  // loadTasks (logo adiante): antes disso, activeView/activeScope ainda
+  // podem estar no fallback Dashboard/global temporário de uma URL tipo
+  // /suprimentos/importacao (índices de slug ainda vazios) — buscar tarefas
+  // pra esse escopo FALSO e concluir "não existe" apagava um selectedTaskId
+  // que só ainda não tinha tido chance de resolver pro escopo de verdade
+  // (achado testando link direto pra tarefa numa pasta grande, 2026-09-06).
+  const hasResolvedInitialUrlRef = useRef(false);
   const navSlugMaps = useMemo<NavSlugMaps>(() => ({
     spaces,
     folders,
@@ -1420,6 +1485,12 @@ export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [myTasks, setMyTasks] = useState<Task[]>([]);
   const [isTasksLoading, setIsTasksLoading] = useState(false);
+  // Diferente de isTasksLoading (que já vira false após só a 1ª página, pra
+  // UI parecer rápida — ver loadTasks): só vira true quando TODAS as páginas
+  // do escopo terminaram. Usado pelo efeito "tarefa não existe mais" logo
+  // abaixo, que senão dispara um falso positivo pra qualquer tarefa fora da
+  // 1ª leva de 100.
+  const [isTasksFullyLoaded, setIsTasksFullyLoaded] = useState(false);
   const [isMyTasksLoading, setIsMyTasksLoading] = useState(false);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
   const [fieldValues, setFieldValues] = useState<CustomFieldValue[]>([]);
@@ -1495,6 +1566,11 @@ export default function App() {
   }));
 
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(() => initialNav.taskId);
+  // Id curto (8 chars) de uma URL tipo .../tarefa/<slug>-<8chars> ainda não
+  // resolvido pra um `selectedTaskId` completo — precisa esperar `tasks` do
+  // escopo carregar pra achar a tarefa correspondente (ver efeito de
+  // resolução logo após loadTasks, mais abaixo).
+  const [pendingTaskSlugId, setPendingTaskSlugId] = useState<string | null>(() => initialNav.taskSlugId);
   const [openMeetingId, setOpenMeetingId] = useState<string | null>(null);
   const handleOpenMeeting = (meetingId: string) => {
     setOpenMeetingId(meetingId);
@@ -1815,12 +1891,29 @@ export default function App() {
   // e não dava nenhuma pista do porquê. `tasks.length > 0` evita um falso
   // positivo enquanto a lista ainda está carregando pela primeira vez.
   useEffect(() => {
-    if (selectedTaskId && tasks.length > 0 && !tasks.some(t => t.id === selectedTaskId)) {
+    if (selectedTaskId && isTasksFullyLoaded && !tasks.some(t => t.id === selectedTaskId)) {
       toast.error('Essa tarefa não existe mais ou você não tem acesso a ela.');
       setSelectedTaskId(null);
       setTaskCommentFocus(null);
     }
-  }, [selectedTaskId, tasks]);
+  }, [selectedTaskId, tasks, isTasksFullyLoaded]);
+
+  // Resolve .../tarefa/<slug>-<8chars> (ver pendingTaskSlugId) assim que
+  // `tasks` do escopo carregar por completo: acha a tarefa cujo id começa
+  // com esses 8 chars e vira selectedTaskId de verdade. Mesmo aviso de "não
+  // existe mais" do efeito acima quando o escopo já carregou e ninguém bate
+  // — espera `isTasksFullyLoaded`, não só a 1ª página, senão uma tarefa fora
+  // das primeiras 100 (ordenadas por created_at) parecia "não existir".
+  useEffect(() => {
+    if (!pendingTaskSlugId || !isTasksFullyLoaded) return;
+    const match = tasks.find(t => t.id.startsWith(pendingTaskSlugId));
+    if (match) {
+      setSelectedTaskId(match.id);
+    } else {
+      toast.error('Essa tarefa não existe mais ou você não tem acesso a ela.');
+    }
+    setPendingTaskSlugId(null);
+  }, [pendingTaskSlugId, tasks, isTasksFullyLoaded]);
 
   // Card "Recentes" de Minhas Tarefas: registra toda tarefa aberta, pra
   // qualquer entrada (clique na lista, notificação, link direto etc.).
@@ -1895,11 +1988,31 @@ export default function App() {
     // nessa janela. O efeito que dispara loadTasks já reage a mudanças de
     // currentUser.id (ver abaixo), então essa corrida se resolve sozinha.
     if (currentUser.id === 'loading') return;
+    // Antes da URL ser resolvida contra os dados reais (ver
+    // hasResolvedInitialUrlRef), activeView/activeScope ainda podem estar no
+    // fallback Dashboard/global temporário de uma URL tipo
+    // /suprimentos/importacao — buscar tarefas pra esse escopo FALSO batia
+    // isGlobalDashboard, marcava `isTasksFullyLoaded` na hora e apagava um
+    // selectedTaskId (vindo de ?taskId= ou já resolvido) que só ainda não
+    // tinha tido chance de carregar no escopo de verdade. O efeito de
+    // entrada sempre cria um `activeScope` novo (objeto novo, mesmo quando o
+    // valor não muda), então este loadTasks dispara de novo assim que ele
+    // rodar — não fica travado pra sempre.
+    if (!hasResolvedInitialUrlRef.current) return;
 
     const requestId = ++loadTasksRequestIdRef.current;
+    // "Tarefa não existe mais" (ver efeito logo abaixo) só pode confiar em
+    // `tasks` depois que a carga estiver DE VERDADE completa — a 1ª página
+    // (100 linhas) já dispara `tasks.length > 0` bem antes das páginas
+    // restantes chegarem, e uma tarefa fora dessas 100 primeiras (ordenadas
+    // por created_at) parecia "não existir" e fechava o modal sozinha
+    // (achado testando link direto pra uma tarefa antiga numa pasta com
+    // 3374 tarefas, 2026-09-06).
+    setIsTasksFullyLoaded(false);
     const isGlobalDashboard = activeView === 'Dashboard' && activeScope.type === 'global' && !activeListId;
     if (isGlobalDashboard) {
       setIsTasksLoading(false);
+      setIsTasksFullyLoaded(true);
       return;
     }
 
@@ -1919,6 +2032,7 @@ export default function App() {
           for (const t of mappedTasks) merged.set(t.id, preserveLoadedTaskDetails(t, merged.get(t.id)));
           return Array.from(merged.values());
         });
+        setIsTasksFullyLoaded(true);
       } catch (err) {
         console.error('Erro ao carregar Minhas Tarefas:', err);
         if (requestId === loadTasksRequestIdRef.current && !loadTasksRetriedRef.current) {
@@ -1962,6 +2076,7 @@ export default function App() {
         // sempre (a cada volta a 1ª página carregava OK e zerava a flag nesse
         // ponto de novo) sem nunca chegar no toast de erro terminal.
         loadTasksRetriedRef.current = false;
+        setIsTasksFullyLoaded(true);
         return;
       }
 
@@ -1974,6 +2089,7 @@ export default function App() {
         .map(taskRepo.mapRowToTaskShell)
         .map(task => preserveLoadedTaskDetails(task, prev.find(existing => existing.id === task.id))));
       loadTasksRetriedRef.current = false;
+      setIsTasksFullyLoaded(true);
     } catch (err) {
       console.error('Erro ao carregar tarefas:', err);
       if (requestId === loadTasksRequestIdRef.current && !loadTasksRetriedRef.current) {
@@ -1985,6 +2101,7 @@ export default function App() {
         setTimeout(() => { loadTasksRef.current?.(); }, 1500);
       } else {
         loadTasksRetriedRef.current = false;
+        setIsTasksFullyLoaded(true);
         toast.error('Não foi possível carregar as tarefas. Tente novamente.');
       }
     } finally {
@@ -3161,22 +3278,29 @@ export default function App() {
   // setActiveListId/setActiveScope diretamente. Não inclui `location`/`navigate`
   // nas deps de propósito: só deve rodar quando o ESTADO de navegação muda, não
   // a cada mudança de URL (senão loopa com o efeito de entrada abaixo).
-  // Usada por este efeito E pelo de entrada logo abaixo — ver comentário lá.
-  const hasResolvedInitialUrlRef = useRef(false);
+  // hasResolvedInitialUrlRef declarada lá em cima (perto de workspaceMetaLoaded)
+  // — também usada por loadTasks. Usada por este efeito E pelo de entrada logo abaixo.
   useEffect(() => {
     // Antes da primeira resolução (ver efeito de entrada logo abaixo), o
     // estado inicial de uma URL tipo /suprimentos/importacao ainda não foi
     // resolvido (índices de slug vazios) e vale um Dashboard/global
     // provisório — se este efeito navegasse pra `/` nesse meio-tempo, o
-    // deep link seria destruído antes dos dados chegarem.
-    if (!hasResolvedInitialUrlRef.current) return;
-    const targetPath = computeNavPath({ activeView, activeListId, activeScope, activeDocId, selectedTaskId }, location.search, navSlugMaps);
+    // deep link seria destruído antes dos dados chegarem. Mesma lógica pra
+    // pendingTaskSlugId: enquanto .../tarefa/<slug>-<id> ainda não resolveu
+    // pra um selectedTaskId de verdade, esse efeito reescreveria a URL sem
+    // o segmento de tarefa (selectedTaskId ainda é null) — espera resolver.
+    if (!hasResolvedInitialUrlRef.current || pendingTaskSlugId) return;
+    const targetPath = computeNavPath({ activeView, activeListId, activeScope, activeDocId, selectedTaskId }, location.search, navSlugMaps, tasks);
     const currentPath = `${location.pathname}${location.search}`;
     if (targetPath !== currentPath) {
       navigate(targetPath);
     }
+    // `tasks` está nas deps só por causa do sufixo /tarefa/<slug>-<id>: uma
+    // tarefa aberta antes de `tasks` do escopo terminar de carregar cai no
+    // `?taskId=` legado (ver computeNavPath) até `tasks` chegar com o título
+    // — sem essa dep, o efeito não roda de novo pra promover a URL.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeView, activeListId, activeScope.type, activeScope.id, activeScope.name, activeDocId, selectedTaskId, navSlugMaps]);
+  }, [activeView, activeListId, activeScope.type, activeScope.id, activeScope.name, activeDocId, selectedTaskId, navSlugMaps, pendingTaskSlugId, tasks]);
 
   // Entrada: aplica a URL de volta ao estado. Roda em duas situações:
   // (1) a URL mudou por ação do navegador (voltar/avançar, ou um link colado
@@ -3197,6 +3321,7 @@ export default function App() {
     setActiveListId(parsed.listId);
     setActiveDocId(parsed.docId);
     setSelectedTaskId(parsed.taskId);
+    setPendingTaskSlugId(parsed.taskSlugId);
     setTaskCommentFocus(null);
     setActiveScope({ type: parsed.scopeType, id: parsed.scopeId, name: parsed.scopeName });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -7508,11 +7633,15 @@ function KanbanView({ tasks, onSelectTask, onStatusChange, onQuickUpdateTask, on
   };
 
   const copyTaskLink = async (taskId: string) => {
-    // Preserva os params já presentes (ex: ?listId=, ?scope=) em vez de
+    // Preserva o path/params já presentes (ex: espaço/pasta atual) em vez de
     // descartá-los — sem isso, o link compartilhado perdia o contexto de
-    // lista/espaço de onde a tarefa foi aberta.
+    // onde a tarefa foi aberta. O sufixo /tarefa/<slug>-<id> troca (ou
+    // adiciona) só o final do path — ver withTaskPathSuffix.
+    const task = tasks.find(t => t.id === taskId);
     const url = new URL(window.location.href);
-    url.searchParams.set('taskId', taskId);
+    url.searchParams.delete('taskId');
+    url.pathname = withTaskPathSuffix(url.pathname, task);
+    if (!task) url.searchParams.set('taskId', taskId); // fallback: tarefa ainda não carregada localmente
     try {
       await navigator.clipboard.writeText(url.toString());
       toast.success('Link da tarefa copiado.');
@@ -9368,11 +9497,12 @@ function TaskDetailModal(props: any) {
           <div className="flex items-center gap-4">
             <button
               onClick={() => {
-                // Preserva os params já presentes (ex: ?listId=, ?scope=) em
-                // vez de descartá-los — sem isso, o link compartilhado perdia
-                // o contexto de lista/espaço de onde a tarefa foi aberta.
+                // Preserva o path/params já presentes — sem isso, o link
+                // compartilhado perdia o contexto de onde a tarefa foi
+                // aberta. Ver withTaskPathSuffix.
                 const url = new URL(window.location.href);
-                url.searchParams.set('taskId', task.id);
+                url.searchParams.delete('taskId');
+                url.pathname = withTaskPathSuffix(url.pathname, task);
                 navigator.clipboard.writeText(url.toString());
                 alert('Link da tarefa copiado!');
               }}
