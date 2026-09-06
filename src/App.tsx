@@ -2794,12 +2794,13 @@ export default function App() {
       // `toISOString()` converte para UTC: à noite no Brasil (UTC-3) já é o dia
       // seguinte em UTC, o que fazia tarefas criadas de noite nascerem com data
       // de início/prazo erradas. Usamos data local.
+      const mainAssigneeId = newTaskPartial.mainAssigneeId || currentUser.id;
       const res = await taskRepo.insertTask({
         title: newTaskPartial.title || 'Nova Tarefa',
         description: newTaskPartial.description || '',
         status: newTaskPartial.status || defaultStatus,
         priority: newTaskPartial.priority || TaskPriority.MEDIA,
-        mainAssigneeId: newTaskPartial.mainAssigneeId || currentUser.id,
+        mainAssigneeId,
         secondaryAssigneeIds: [],
         startDate: formatLocalDate(new Date()),
         // Sem prazo inventado (achado de QA): antes toda tarefa nova sem
@@ -2818,6 +2819,11 @@ export default function App() {
         if (belongsToMyTasks(res.task)) {
           setMyTasks(prev => [res.task, ...prev.filter(t => t.id !== res.task.id)]);
         }
+        // Achado na auditoria da Caixa de Entrada: só as trocas de responsável
+        // em tarefa já existente notificavam (handleSetMainAssignee etc.) —
+        // criar já atribuída a outra pessoa não avisava ninguém.
+        // notifyAssignment já filtra auto-notificação (criador = responsável).
+        notifyAssignment({ userIds: [mainAssigneeId], actor: currentUser, taskId: res.task.id, taskTitle: res.task.title });
         setIsTaskModalOpen(false);
         setPrefilledTaskData(null);
         toast.success('Tarefa criada com sucesso!');
