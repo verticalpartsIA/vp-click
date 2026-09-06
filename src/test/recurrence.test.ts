@@ -80,6 +80,50 @@ describe('calcNextOccurrence — monthly', () => {
   });
 });
 
+describe('casos extremos de calendário (issue #184 seção 29)', () => {
+  it('dia 31 clampado num mês de 30 dias (abril)', () => {
+    const rule: RecurrenceRuleForCalc = { ...baseRule, frequencyType: 'monthly', monthDay: 31 };
+    const after = new Date('2027-03-31T12:00:00Z');
+    const next = calcNextOccurrence(rule, after, startAt);
+    expect(next?.getUTCMonth()).toBe(3); // abril (0-indexed)
+    expect(next?.getUTCDate()).toBe(30);
+  });
+
+  it('dia 31 clampado em fevereiro de ano bissexto (29 dias)', () => {
+    const rule: RecurrenceRuleForCalc = { ...baseRule, frequencyType: 'monthly', monthDay: 31 };
+    const after = new Date('2028-01-31T12:00:00Z'); // 2028 é bissexto
+    const next = calcNextOccurrence(rule, after, startAt);
+    expect(next?.getUTCFullYear()).toBe(2028);
+    expect(next?.getUTCMonth()).toBe(1);
+    expect(next?.getUTCDate()).toBe(29);
+  });
+
+  it('diária atravessa a virada do ano corretamente', () => {
+    const rule = { ...baseRule, frequencyType: 'daily' as const };
+    const after = new Date('2026-12-31T12:00:00Z');
+    const next = calcNextOccurrence(rule, after, startAt);
+    expect(next?.toISOString()).toBe('2027-01-01T12:00:00.000Z');
+  });
+
+  it('mensal atravessa a virada do ano (dezembro -> janeiro)', () => {
+    const rule: RecurrenceRuleForCalc = { ...baseRule, frequencyType: 'monthly', monthDay: 15 };
+    const after = new Date('2026-12-15T12:00:00Z');
+    const next = calcNextOccurrence(rule, after, startAt);
+    expect(next?.getUTCFullYear()).toBe(2027);
+    expect(next?.getUTCMonth()).toBe(0); // janeiro
+    expect(next?.getUTCDate()).toBe(15);
+  });
+
+  it('anual com início em 29/fev cai em 28/fev nos anos não-bissextos', () => {
+    const leapStartAt = new Date('2028-02-29T12:00:00Z'); // 2028 é bissexto
+    const rule: RecurrenceRuleForCalc = { ...baseRule, frequencyType: 'yearly' };
+    const next = calcNextOccurrence(rule, leapStartAt, leapStartAt);
+    expect(next?.getUTCFullYear()).toBe(2029);
+    expect(next?.getUTCMonth()).toBe(1); // fevereiro
+    expect(next?.getUTCDate()).toBe(28); // 2029 não é bissexto
+  });
+});
+
 describe('calcNextOccurrence — yearly', () => {
   it('mesmo mês/dia do ano seguinte', () => {
     const rule: RecurrenceRuleForCalc = { ...baseRule, frequencyType: 'yearly' };

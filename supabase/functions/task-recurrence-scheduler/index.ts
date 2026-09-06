@@ -96,6 +96,36 @@ function applyMisfirePolicy(due: Date[], policy: string): Date[] {
   return due.length === 1 ? due : [];
 }
 
+// Issue #184 seção 21: "se o responsável original não estiver mais válido,
+// definir fallback seguro e registrar log". Um usuário desativado (soft-delete,
+// ver profiles.is_active) não pode continuar recebendo tarefas novas — a
+// ocorrência nasce sem esse responsável em vez de referenciar alguém inválido.
+async function filterActiveUserIds(admin: any, ids: (string | null | undefined)[]): Promise<Set<string>> {
+  const unique = [...new Set(ids.filter((id): id is string => !!id))];
+  if (unique.length === 0) return new Set();
+  const { data } = await admin.from('profiles').select('id').eq('is_active', true).in('id', unique);
+  return new Set((data || []).map((p: { id: string }) => p.id));
+}
+
+function resolveAssignees(
+  mainAssigneeId: string | null,
+  secondaryAssigneeIds: string[] | null,
+  activeIds: Set<string>,
+  logContext: string,
+): { mainAssigneeId: string | null; secondaryAssigneeIds: string[] } {
+  let main = mainAssigneeId;
+  if (main && !activeIds.has(main)) {
+    console.error(`[task-recurrence-scheduler] ${logContext}: responsável principal ${main} inativo/removido — ocorrência criada sem responsável.`);
+    main = null;
+  }
+  const secondary = (secondaryAssigneeIds || []).filter((id) => {
+    if (activeIds.has(id)) return true;
+    console.error(`[task-recurrence-scheduler] ${logContext}: responsável adicional ${id} inativo/removido — removido da nova ocorrência.`);
+    return false;
+  });
+  return { mainAssigneeId: main, secondaryAssigneeIds: secondary };
+}
+
 async function fetchLatestOccurrenceTask(admin: any, rule: RuleRow) {
   if (rule.occurrences_created === 0) {
     const { data } = await admin.from('tasks').select('id,status').eq('id', rule.task_id).maybeSingle();
@@ -172,9 +202,16 @@ async function cloneSubtasks(
     .eq('parent_id', parentSourceId);
   if (!subtasks || subtasks.length === 0) return;
 
+  const activeIds = inherit.includeAssignees
+    ? await filterActiveUserIds(admin, (subtasks as any[]).flatMap((s) => [s.main_assignee_id, ...(s.secondary_assignee_ids || [])]))
+    : new Set<string>();
+
   for (const sub of subtasks as any[]) {
     const startDate = inherit.remapSubtaskDates ? remapDate(sub.start_date, anchorOriginal, anchorNew) : null;
     const dueDate = inherit.remapSubtaskDates ? remapDate(sub.due_date, anchorOriginal, anchorNew) : null;
+    const assignees = inherit.includeAssignees
+      ? resolveAssignees(sub.main_assignee_id, sub.secondary_assignee_ids, activeIds, `subtarefa ${sub.id}`)
+      : { mainAssigneeId: null, secondaryAssigneeIds: [] };
 
     const { data: insertedSub, error: subErr } = await admin
       .from('tasks')
@@ -183,8 +220,8 @@ async function cloneSubtasks(
         description: inherit.includeDescription ? sub.description : '',
         status: sub.status,
         priority: inherit.includePriority ? sub.priority : 'Media',
-        main_assignee_id: inherit.includeAssignees ? sub.main_assignee_id : null,
-        secondary_assignee_ids: inherit.includeAssignees ? (sub.secondary_assignee_ids || []) : [],
+        main_assignee_id: assignees.mainAssigneeId,
+        secondary_assignee_ids: assignees.secondaryAssigneeIds,
         start_date: startDate,
         due_date: dueDate,
         list_id: listId,
@@ -242,6 +279,15 @@ async function createOccurrenceTask(
   const tags = inherit.includeTags ? (template.tags || []) : [];
   const finalTags = flagOverlap ? [...tags, 'recorrencia-sobreposta'] : tags;
 
+  const templateAssignees = inherit.includeAssignees
+    ? resolveAssignees(
+        template.main_assignee_id,
+        template.secondary_assignee_ids,
+        await filterActiveUserIds(admin, [template.main_assignee_id, ...(template.secondary_assignee_ids || [])]),
+        `tarefa-modelo ${rule.task_id}`,
+      )
+    : { mainAssigneeId: null, secondaryAssigneeIds: [] };
+
   const { data: inserted, error } = await admin
     .from('tasks')
     .insert({
@@ -249,8 +295,8 @@ async function createOccurrenceTask(
       description: inherit.includeDescription ? template.description : '',
       status,
       priority: inherit.includePriority ? template.priority : 'Media',
-      main_assignee_id: inherit.includeAssignees ? template.main_assignee_id : null,
-      secondary_assignee_ids: inherit.includeAssignees ? (template.secondary_assignee_ids || []) : [],
+      main_assignee_id: templateAssignees.mainAssigneeId,
+      secondary_assignee_ids: templateAssignees.secondaryAssigneeIds,
       start_date: startDate,
       due_date: dueDate,
       list_id: rule.list_id,
@@ -371,15 +417,12 @@ Deno.serve(async (req: Request) => {
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
 
-  const { data: rules, error: rulesErr } = await admin
-    .from('task_recurrence_rules')
-    .select('*')
-    .eq('enabled', true)
-    .eq('trigger_mode', 'on_schedule')
-    .not('next_run_at', 'is', null)
-    .lte('next_run_at', nowIso)
-    .order('next_run_at', { ascending: true })
-    .limit(50);
+  // Claim atômico via FOR UPDATE SKIP LOCKED (issue #184 seção 20) — impede
+  // que dois workers concorrentes (dois ticks do cron sobrepostos, ou um
+  // retry) processem a mesma regra ao mesmo tempo. Regras cujo lock expirou
+  // (worker anterior morreu sem liberar) voltam a ficar disponíveis depois
+  // de p_lock_ttl_minutes.
+  const { data: rules, error: rulesErr } = await admin.rpc('claim_due_recurrence_rules', { p_limit: 50, p_lock_ttl_minutes: 10 });
 
   if (rulesErr) return json({ error: rulesErr.message }, 500);
   if (!rules || rules.length === 0) return json({ processed: 0, created: 0 });
@@ -397,13 +440,20 @@ Deno.serve(async (req: Request) => {
     try {
       const result = await processRule(admin, rule, nowMs, holidays);
       processed += 1;
-      if ('postponed' in result && result.postponed) continue; // não atualiza next_run_at
+      if ('postponed' in result && result.postponed) {
+        // Não avança next_run_at, mas libera o lock — sem isso a regra
+        // ficaria travada até o TTL expirar em vez de ser reavaliada no
+        // próximo tick (5 min).
+        await admin.from('task_recurrence_rules').update({ locked_at: null }).eq('id', rule.id);
+        continue;
+      }
 
       totalCreated += result.created ?? 0;
       const update: Record<string, unknown> = {
         occurrences_created: result.occurrencesCreated ?? rule.occurrences_created,
         last_generated_at: (result.created ?? 0) > 0 ? nowIso : undefined,
         next_run_at: result.disable ? null : (result.following ? result.following.toISOString() : null),
+        locked_at: null,
       };
       if (result.disable) update.enabled = false;
       // remove chaves undefined (Supabase JS não filtra sozinho)
@@ -412,6 +462,8 @@ Deno.serve(async (req: Request) => {
       await admin.from('task_recurrence_rules').update(update).eq('id', rule.id);
     } catch (e) {
       errors.push(`${rule.id}: ${e instanceof Error ? e.message : String(e)}`);
+      // Libera o lock mesmo em erro — sem isso a regra fica presa até o TTL.
+      await admin.from('task_recurrence_rules').update({ locked_at: null }).eq('id', rule.id);
     }
   }
 

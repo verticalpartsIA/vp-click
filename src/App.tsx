@@ -6613,7 +6613,7 @@ function toDatetimeLocalValue(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-interface RecurrenceFormState {
+export interface RecurrenceFormState {
   frequencyType: RecurrenceFrequencyType;
   interval: number;
   weekdays: number[];
@@ -6633,7 +6633,7 @@ interface RecurrenceFormState {
   misfirePolicy: RecurrenceMisfirePolicy;
 }
 
-function defaultRecurrenceForm(task: Task | null): RecurrenceFormState {
+export function defaultRecurrenceForm(task: Task | null): RecurrenceFormState {
   const now = new Date();
   now.setMinutes(0, 0, 0);
   now.setHours(now.getHours() + 1);
@@ -6681,6 +6681,48 @@ function ruleToRecurrenceForm(rule: TaskRecurrenceRule): RecurrenceFormState {
     inheritOptions: rule.inheritOptions,
     overlapPolicy: rule.overlapPolicy,
     misfirePolicy: rule.misfirePolicy,
+  };
+}
+
+// Valida o formulário e monta o payload que o backend consome — extraído do
+// componente pra ser testável sem precisar montar o Dialog (issue #184 seção
+// 30, "teste E2E/Cypress para configuração da recorrência pela UI": o
+// projeto não usa Cypress, então a cobertura equivalente aqui é testar essa
+// função pura diretamente, no mesmo estilo Vitest já usado no resto do repo).
+export function buildRecurrenceRuleInput(
+  form: RecurrenceFormState,
+): { input: Omit<import('./lib/taskRepo').RecurrenceRuleInput, 'taskId' | 'listId' | 'createdBy'> } | { error: string } {
+  const startAtDate = new Date(form.startAt);
+  if (Number.isNaN(startAtDate.getTime())) {
+    return { error: 'Informe uma data/hora de início válida.' };
+  }
+  if (form.frequencyType === 'weekly' && form.weekdays.length === 0) {
+    return { error: 'Selecione ao menos um dia da semana.' };
+  }
+
+  return {
+    input: {
+      frequencyType: form.frequencyType,
+      interval: Math.max(1, form.interval),
+      weekdays: form.frequencyType === 'weekly' ? form.weekdays : [],
+      monthDay: form.frequencyType === 'monthly' && form.monthMode === 'day' ? form.monthDay : null,
+      monthWeek: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeek : null,
+      monthWeekday: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeekday : null,
+      startAt: startAtDate.toISOString(),
+      // A primeira ocorrência gerada é exatamente o start_at — o scheduler
+      // avança a partir daí a cada execução (ver task-recurrence-scheduler).
+      nextRunAt: startAtDate.toISOString(),
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo',
+      skipWeekends: form.skipWeekends,
+      skipHolidays: form.skipHolidays,
+      weekendShift: form.weekendShift,
+      endMode: form.endMode,
+      endAt: form.endMode === 'until' && form.endAt ? new Date(`${form.endAt}T23:59:59`).toISOString() : null,
+      maxOccurrences: form.endMode === 'count' ? Math.max(1, form.maxOccurrences) : null,
+      inheritOptions: form.inheritOptions,
+      overlapPolicy: form.overlapPolicy,
+      misfirePolicy: form.misfirePolicy,
+    },
   };
 }
 
@@ -6732,38 +6774,12 @@ function RecurrenceConfigModal({
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
     if (isSubmitting) return;
-    const startAtDate = new Date(form.startAt);
-    if (Number.isNaN(startAtDate.getTime())) {
-      toast.error('Informe uma data/hora de início válida.');
+    const result = buildRecurrenceRuleInput(form);
+    if ('error' in result) {
+      toast.error(result.error);
       return;
     }
-    if (form.frequencyType === 'weekly' && form.weekdays.length === 0) {
-      toast.error('Selecione ao menos um dia da semana.');
-      return;
-    }
-
-    onSave({
-      frequencyType: form.frequencyType,
-      interval: Math.max(1, form.interval),
-      weekdays: form.frequencyType === 'weekly' ? form.weekdays : [],
-      monthDay: form.frequencyType === 'monthly' && form.monthMode === 'day' ? form.monthDay : null,
-      monthWeek: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeek : null,
-      monthWeekday: form.frequencyType === 'monthly' && form.monthMode === 'nth' ? form.monthWeekday : null,
-      startAt: startAtDate.toISOString(),
-      // A primeira ocorrência gerada é exatamente o start_at — o scheduler
-      // avança a partir daí a cada execução (ver task-recurrence-scheduler).
-      nextRunAt: startAtDate.toISOString(),
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Sao_Paulo',
-      skipWeekends: form.skipWeekends,
-      skipHolidays: form.skipHolidays,
-      weekendShift: form.weekendShift,
-      endMode: form.endMode,
-      endAt: form.endMode === 'until' && form.endAt ? new Date(`${form.endAt}T23:59:59`).toISOString() : null,
-      maxOccurrences: form.endMode === 'count' ? Math.max(1, form.maxOccurrences) : null,
-      inheritOptions: form.inheritOptions,
-      overlapPolicy: form.overlapPolicy,
-      misfirePolicy: form.misfirePolicy,
-    });
+    onSave(result.input);
   };
 
   const inheritItems: Array<{ key: keyof RecurrenceInheritOptions; label: string }> = [
