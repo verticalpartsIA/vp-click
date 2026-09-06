@@ -382,9 +382,13 @@ export async function fetchCustomFieldValuesByEntityIds(entityIds: string[]): Pr
   const uniqueIds = Array.from(new Set(entityIds.filter(Boolean)));
   if (uniqueIds.length === 0) return [];
 
-  const rows: CustomFieldValueRow[] = [];
+  // Mesmo motivo do fetchSubEntityInChunks: lotes são requisições
+  // independentes, então disparamos em paralelo em vez de um atrás do outro.
+  const chunks: string[][] = [];
   for (let i = 0; i < uniqueIds.length; i += SUBENTITY_CHUNK) {
-    const slice = uniqueIds.slice(i, i + SUBENTITY_CHUNK);
+    chunks.push(uniqueIds.slice(i, i + SUBENTITY_CHUNK));
+  }
+  const chunkResults = await Promise.all(chunks.map(async (slice) => {
     const { data, error } = await supabase
       .from('custom_field_values')
       .select('field_id, entity_id, value')
@@ -392,10 +396,11 @@ export async function fetchCustomFieldValuesByEntityIds(entityIds: string[]): Pr
 
     if (error) {
       console.error('taskRepo.fetchCustomFieldValuesByEntityIds: erro ao carregar lote:', error);
-      continue;
+      return [];
     }
-    if (data) rows.push(...(data as CustomFieldValueRow[]));
-  }
+    return (data as CustomFieldValueRow[]) ?? [];
+  }));
+  const rows: CustomFieldValueRow[] = chunkResults.flat();
 
   return rows.map((v) => ({
     fieldId: v.field_id,
@@ -427,24 +432,32 @@ export async function searchTaskRowsByTitle(term: string, limit = 200): Promise<
   return (data || []) as TaskRow[];
 }
 
-// Busca uma sub-entidade filtrando por task_id em lotes seguros de IDs.
+// Busca uma sub-entidade filtrando por task_id em lotes seguros de IDs. Os
+// lotes são requisições independentes (o corte de 150 é só pra manter a URL
+// dentro do limite, ver SUBENTITY_CHUNK) — disparar todos em paralelo em vez
+// de um atrás do outro evita somar a latência de cada round-trip em série
+// (ex.: uma pasta com ~3400 tarefas gera ~23 lotes; em série isso passava de
+// meio minuto só nessa sub-entidade, achado em produção com /equipamentos/
+// 02-projeto-em-andamento em 2026-09-06).
 async function fetchSubEntityInChunks<T>(
   taskIds: string[],
   build: (ids: string[]) => PromiseLike<PostgrestResult<T>>,
   label: string,
 ): Promise<T[]> {
-  const out: T[] = [];
+  const chunks: string[][] = [];
   for (let i = 0; i < taskIds.length; i += SUBENTITY_CHUNK) {
     const slice = taskIds.slice(i, i + SUBENTITY_CHUNK);
-    if (slice.length === 0) continue;
+    if (slice.length > 0) chunks.push(slice);
+  }
+  const results = await Promise.all(chunks.map(async (slice, idx) => {
     const { data: part, error } = await build(slice);
     if (error) {
-      console.error(`taskRepo.hydrateTaskRows: erro ao carregar ${label} (lote ${i / SUBENTITY_CHUNK}):`, error);
-      continue;
+      console.error(`taskRepo.hydrateTaskRows: erro ao carregar ${label} (lote ${idx}):`, error);
+      return [];
     }
-    if (part) out.push(...part);
-  }
-  return out;
+    return part ?? [];
+  }));
+  return results.flat();
 }
 
 // Hidrata linhas de `tasks` em objetos Task completos, buscando as
