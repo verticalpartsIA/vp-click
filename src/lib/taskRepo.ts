@@ -38,6 +38,10 @@ const TASK_ROW_SELECT = [
   'created_by',
   'tags',
   'is_milestone',
+  'recurrence_rule_id',
+  'recurrence_parent_task_id',
+  'recurrence_sequence',
+  'scheduled_occurrence_at',
 ].join(',');
 
 // ── Formato cru das linhas do banco (snake_case) ────────────────────────────
@@ -59,6 +63,10 @@ export interface TaskRow {
   created_by: string | null;
   tags: string[] | null;
   is_milestone: boolean | null;
+  recurrence_rule_id: string | null;
+  recurrence_parent_task_id: string | null;
+  recurrence_sequence: number | null;
+  scheduled_occurrence_at: string | null;
 }
 interface AttachmentRow { id: string; task_id: string; name: string; url: string; type: string; size: number; uploaded_at: string; }
 interface CommentRow {
@@ -136,6 +144,10 @@ const mapTaskCore = (d: TaskRow) => ({
   createdBy: d.created_by || undefined,
   tags: d.tags || [],
   isMilestone: d.is_milestone ?? false,
+  recurrenceRuleId: d.recurrence_rule_id || undefined,
+  recurrenceParentTaskId: d.recurrence_parent_task_id || undefined,
+  recurrenceSequence: d.recurrence_sequence ?? undefined,
+  scheduledOccurrenceAt: d.scheduled_occurrence_at || undefined,
 });
 
 // Task "shell": campos preenchidos, sub-entidades vazias. Usado nas listagens,
