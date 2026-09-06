@@ -1735,6 +1735,12 @@ export default function App() {
 
   const loadTasks = useCallback(async () => {
     if (!session) return;
+    // `currentUser` ainda é o placeholder FALLBACK_USER (id 'loading') logo
+    // após o login, antes do perfil real chegar — chamar fetchMyTaskRows com
+    // esse id gera 400 (uuid inválido) toda vez que "Minhas Tarefas" carrega
+    // nessa janela. O efeito que dispara loadTasks já reage a mudanças de
+    // currentUser.id (ver abaixo), então essa corrida se resolve sozinha.
+    if (currentUser.id === 'loading') return;
 
     const requestId = ++loadTasksRequestIdRef.current;
     const isGlobalDashboard = activeView === 'Dashboard' && activeScope.type === 'global' && !activeListId;
@@ -6335,11 +6341,18 @@ function ListView({
 
   const [expandedStatuses, setExpandedStatuses] = useState<string[]>([]);
 
+  // Cada grupo expandido monta uma <table> com todas as linhas daquele status
+  // (sem virtualização). Expandir tudo por padrão travava o navegador em
+  // escopos grandes (ex.: um espaço com ~6.000 tarefas tentava montar milhares
+  // de <tr> de uma vez). Acima do limiar, começa tudo fechado — o usuário
+  // ainda expande qualquer grupo com um clique, sem perder a funcionalidade.
+  const AUTO_EXPAND_TASK_LIMIT = 300;
   useEffect(() => {
-    if (JSON.stringify(expandedStatuses) !== JSON.stringify(statusOrder)) {
-      setExpandedStatuses(statusOrder);
+    const nextExpanded = tasks.length > AUTO_EXPAND_TASK_LIMIT ? [] : statusOrder;
+    if (JSON.stringify(expandedStatuses) !== JSON.stringify(nextExpanded)) {
+      setExpandedStatuses(nextExpanded);
     }
-  }, [statusOrder]);
+  }, [statusOrder, tasks.length]);
 
   const [expandedTasks, setExpandedTasks] = useState<Set<string>>(new Set());
 
