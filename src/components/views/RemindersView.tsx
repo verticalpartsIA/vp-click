@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import { supabase } from '../../lib/supabase';
 import { avatarThumb } from '../../lib/avatarUrl';
+import { formatDateTimeShortBR } from '../../lib/dates';
 import { List, Reminder, ReminderNotifyPreference, User } from '../../types';
 import {
   DropdownMenu,
@@ -53,9 +54,9 @@ function toDatetimeLocalValue(iso: string) {
   return `${y}-${m}-${day}T${h}:${min}`;
 }
 
-function formatDueAt(iso: string) {
-  return new Date(iso).toLocaleString('pt-BR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
-}
+// formatDueAt agora vive em lib/dates como formatDateTimeShortBR (issue
+// #102, achado 3).
+const formatDueAt = formatDateTimeShortBR;
 
 function mapRow(r: any): Reminder {
   return {
@@ -266,7 +267,7 @@ export function RemindersView({ currentUser, users, lists, onOpenTask, onCreateT
     <div className="max-w-2xl mx-auto">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <h1 className="text-xl font-bold text-gray-800">Hoje e atrasadas</h1>
+          <h2 className="text-xl font-bold text-gray-800">Hoje e atrasadas</h2>
           {pendingBadge > 0 && (
             <span className="bg-purple-100 text-purple-600 text-xs font-bold px-2 py-0.5 rounded-full">{pendingBadge}</span>
           )}

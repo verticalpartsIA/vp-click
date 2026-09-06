@@ -3,6 +3,7 @@ import { toast } from 'sonner';
 import { PRIORITY_COLORS } from '../../constants';
 import { avatarThumb } from '../../lib/avatarUrl';
 import { readRecentTaskIds } from '../../lib/recentTasks';
+import { formatShortDateBR } from '../../lib/dates';
 import { Task, User } from '../../types';
 
 interface MyTasksViewProps {
@@ -120,7 +121,7 @@ export function MyTasksView({ currentUser, users, tasks, isLoading = false, onOp
 
   return (
     <div className="max-w-5xl mx-auto">
-      <h1 className="text-2xl font-bold text-gray-800 mb-4">{greeting()}, {currentUser.name.split(' ')[0]}</h1>
+      <h2 className="text-2xl font-bold text-gray-800 mb-4">{greeting()}, {currentUser.name.split(' ')[0]}</h2>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="space-y-4">
@@ -172,7 +173,7 @@ export function MyTasksView({ currentUser, users, tasks, isLoading = false, onOp
                         task={t}
                         users={users}
                         onOpenTask={onOpenTask}
-                        rightSlot={t.dueDate ? <span className="text-[10px] text-gray-400 shrink-0">{new Date(t.dueDate + 'T00:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' })}</span> : undefined}
+                        rightSlot={t.dueDate ? <span className="text-[10px] text-gray-400 shrink-0">{formatShortDateBR(t.dueDate)}</span> : undefined}
                       />
                     ))}
                   </div>
@@ -242,7 +243,7 @@ export function MyTasksView({ currentUser, users, tasks, isLoading = false, onOp
                         <td className="py-2 truncate max-w-[200px]">{t.title}</td>
                         <td className="py-2"><PriorityBadge priority={t.priority} /></td>
                         <td className="py-2 text-right text-xs text-gray-400">
-                          {t.dueDate ? new Date(t.dueDate + 'T00:00:00').toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }) : '—'}
+                          {t.dueDate ? formatShortDateBR(t.dueDate) : '—'}
                         </td>
                       </tr>
                     ))}

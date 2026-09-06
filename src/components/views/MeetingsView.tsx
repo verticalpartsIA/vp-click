@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { supabase } from '../../lib/supabase';
 import { avatarThumb } from '../../lib/avatarUrl';
+import { formatMeetingDateTimeBR, formatWeekdayShortBR, formatDayMonthNumericBR } from '../../lib/dates';
 import { Meeting, MeetingActionItem, MeetingRoom, List, User, UserRole } from '../../types';
 import {
   DropdownMenu,
@@ -76,9 +77,9 @@ function mapActionItemRow(i: any): MeetingActionItem {
   };
 }
 
-function formatMeetingDate(d: string) {
-  return new Date(d).toLocaleString('pt-BR', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-}
+// formatMeetingDate agora vive em lib/dates como formatMeetingDateTimeBR
+// (issue #102, achado 3).
+const formatMeetingDate = formatMeetingDateTimeBR;
 
 // Prefixo de dia pro resumo do status das salas: "" hoje, "amanhã " ou
 // "seg 11/08 " — sem isso "próxima às 10:00" não dizia se era hoje ou dias
@@ -90,9 +91,7 @@ function roomDatePrefix(dateStr: string) {
   const diffDays = Math.round((startOfDay(d) - startOfDay(now)) / 86400000);
   if (diffDays === 0) return '';
   if (diffDays === 1) return 'amanhã ';
-  const weekday = d.toLocaleDateString('pt-BR', { weekday: 'short' });
-  const dayMonth = d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-  return `${weekday} ${dayMonth} `;
+  return `${formatWeekdayShortBR(d)} ${formatDayMonthNumericBR(d)} `;
 }
 
 /**
@@ -406,7 +405,7 @@ export function MeetingsView({ currentUser, users, lists, onOpenTask, onCreateTa
 
         <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-5 mb-4">
           <div className="flex items-start justify-between gap-2">
-            <h1 className="text-xl font-bold text-gray-800">{selected.title}</h1>
+            <h2 className="text-xl font-bold text-gray-800">{selected.title}</h2>
             {canCancelMeeting(selected) && (
               <button
                 onClick={() => cancelMeeting(selected)}
@@ -517,7 +516,7 @@ export function MeetingsView({ currentUser, users, lists, onOpenTask, onCreateTa
       <RoomStatusPanel rooms={rooms} users={users} onSelectMeeting={selectMeetingById} />
       <div className="w-full md:flex-1 md:max-w-2xl">
       <div className="flex items-center justify-between mb-4">
-        <h1 className="text-xl font-bold text-gray-800">Reuniões</h1>
+        <h2 className="text-xl font-bold text-gray-800">Reuniões</h2>
         <button
           onClick={() => setShowCreateForm((v) => !v)}
           className="text-xs font-bold bg-orange-500 text-white px-3 py-1.5 rounded-lg hover:brightness-110"

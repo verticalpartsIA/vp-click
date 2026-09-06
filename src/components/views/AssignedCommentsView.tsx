@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { supabase } from '../../lib/supabase';
 import { avatarThumb } from '../../lib/avatarUrl';
+import { relativeTimeBR } from '../../lib/dates';
 import { User } from '../../types';
 
 interface AssignedCommentsViewProps {
@@ -22,18 +23,9 @@ interface AssignedComment {
   resolvedBy?: string;
 }
 
-function relativeTime(date: string) {
-  const diffMs = Date.now() - new Date(date).getTime();
-  const min = Math.floor(diffMs / 60000);
-  if (min < 1) return 'agora';
-  if (min < 60) return `há ${min} min`;
-  const h = Math.floor(min / 60);
-  if (h < 24) return `há ${h}h`;
-  const d = Math.floor(h / 24);
-  if (d === 1) return 'ontem';
-  if (d < 7) return `há ${d} dias`;
-  return new Date(date).toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' });
-}
+// relativeTime agora vive em lib/dates como relativeTimeBR (issue #102,
+// achado 3 — antes idêntica em 4 arquivos).
+const relativeTime = relativeTimeBR;
 
 /**
  * Comentários atribuídos (aba "Comentários atribuídos" da sidebar, item 3 do
@@ -130,7 +122,7 @@ export function AssignedCommentsView({ currentUser, users, onOpenTask }: Assigne
     <div className="max-w-2xl mx-auto">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <h1 className="text-xl font-bold text-gray-800">Comentários atribuídos</h1>
+          <h2 className="text-xl font-bold text-gray-800">Comentários atribuídos</h2>
           {pendingToMeCount > 0 && (
             <span className="bg-purple-100 text-purple-600 text-xs font-bold px-2 py-0.5 rounded-full">{pendingToMeCount} pendente{pendingToMeCount === 1 ? '' : 's'}</span>
           )}

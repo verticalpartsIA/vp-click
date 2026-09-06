@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react';
-import { Plus, Trash2, AlertTriangle, Link2 } from 'lucide-react';
+import { Plus, Trash2, Link2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { WarningText } from '@/components/ui/warning-text';
 import {
   Select,
   SelectContent,
@@ -186,10 +187,9 @@ export function TaskDependencies({
       </div>
 
       {isBlocked && (
-        <div className="flex items-center gap-2 text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+        <WarningText className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs">
           Esta tarefa está bloqueada. Conclua as dependências antes de prosseguir.
-        </div>
+        </WarningText>
       )}
 
       {loading ? (

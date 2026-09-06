@@ -13,6 +13,10 @@ import {
   differenceInDays, eachDayOfInterval, isWeekend, isToday, startOfWeek
 } from 'date-fns';
 import { ptBR } from 'date-fns/locale';
+// exibe/edita sempre em dd/mm/aaaa, ao contrário do <input type="date"> cru
+// (issue #102).
+import { DateFieldEditor } from '@/components/DateFieldEditor';
+import { parseLocalDate, formatLocalDate } from '@/lib/dates';
 
 type GanttScale = 'day' | 'week' | 'month' | 'quarter';
 type GanttGroupBy = 'none' | 'assignee' | 'status' | 'list';
@@ -65,20 +69,8 @@ interface GanttViewProps {
   statusGroups?: StatusGroup[];
 }
 
-// `startDate`/`dueDate` são "YYYY-MM-DD" (sem hora); `new Date(string)`
-// interpreta isso como meia-noite UTC, que em fusos atrás de UTC cai no dia
-// anterior ao comparar com datas locais. Parseamos/formatamos manualmente
-// para não deslocar um dia (mesmo cuidado do resto do app, ver App.tsx).
-function parseLocalDate(dateStr: string): Date {
-  const [y, m, d] = dateStr.split('T')[0].split('-').map(Number);
-  return new Date(y, m - 1, d);
-}
-function formatLocalDate(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
+// parseLocalDate/formatLocalDate agora vivem em lib/dates (issue #102,
+// achado 3 — eram cópias idênticas às de App.tsx e CalendarView).
 
 type DragMode = 'move' | 'resize-left' | 'resize-right';
 
@@ -1444,20 +1436,18 @@ export const GanttView: React.FC<GanttViewProps> = ({ tasks, onTaskClick, onUpda
                                    </label>
                                    <div className="grid grid-cols-2 gap-2">
                                      {!quickDraft.isMilestone && (
-                                       <input
-                                         type="date"
+                                       <DateFieldEditor
                                          value={quickDraft.startDate}
-                                         onChange={(e) => setQuickDraft({ ...quickDraft, startDate: e.target.value })}
+                                         onCommit={(v) => setQuickDraft({ ...quickDraft, startDate: v })}
                                          className="h-8 text-xs border rounded-md px-2"
-                                         title="Início"
+                                         ariaLabel="Início"
                                        />
                                      )}
-                                     <input
-                                       type="date"
+                                     <DateFieldEditor
                                        value={quickDraft.dueDate}
-                                       onChange={(e) => setQuickDraft({ ...quickDraft, dueDate: e.target.value })}
+                                       onCommit={(v) => setQuickDraft({ ...quickDraft, dueDate: v })}
                                        className={`h-8 text-xs border rounded-md px-2 ${quickDraft.isMilestone ? 'col-span-2' : ''}`}
-                                       title={quickDraft.isMilestone ? 'Data do marco' : 'Fim'}
+                                       ariaLabel={quickDraft.isMilestone ? 'Data do marco' : 'Fim'}
                                      />
                                    </div>
                                    {!quickDraft.isMilestone && quickDraft.startDate && quickDraft.dueDate && quickDraft.startDate > quickDraft.dueDate && (

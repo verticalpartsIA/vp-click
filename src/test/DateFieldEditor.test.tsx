@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, fireEvent, act } from "@testing-library/react";
 import { useState } from "react";
-import { DateFieldEditor } from "../App";
+import { DateFieldEditor } from "../components/DateFieldEditor";
 
 // O DateFieldEditor exibe/edita SEMPRE em dd/mm/aaaa (input mascarado,
 // independente do locale do navegador) e persiste em ISO (YYYY-MM-DD).

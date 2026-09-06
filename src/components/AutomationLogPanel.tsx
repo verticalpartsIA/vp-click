@@ -7,6 +7,7 @@ import React, { useEffect, useState } from 'react';
 import { X, CheckCircle2, XCircle, SkipForward, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { fetchAutomationLogs } from '../lib/supabase';
+import { formatDateTimeNumericBR } from '../lib/dates';
 import type { AutomationLog } from '../types';
 
 interface AutomationLogPanelProps {
@@ -27,16 +28,9 @@ const STATUS_LABEL = {
   skipped: 'Ignorado',
 };
 
-function formatDate(iso: string): string {
-  try {
-    return new Intl.DateTimeFormat('pt-BR', {
-      day: '2-digit', month: '2-digit', year: 'numeric',
-      hour: '2-digit', minute: '2-digit',
-    }).format(new Date(iso));
-  } catch {
-    return iso;
-  }
-}
+// formatDate agora vive em lib/dates como formatDateTimeNumericBR (issue
+// #102, achado 3).
+const formatDate = formatDateTimeNumericBR;
 
 export const AutomationLogPanel: React.FC<AutomationLogPanelProps> = ({
   automationId,

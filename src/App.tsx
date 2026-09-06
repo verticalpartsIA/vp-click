@@ -23,12 +23,19 @@ import { buildSlugIndex, slugify, type SlugIndex } from './lib/slug';
 import { lazyImportWithReload, clearChunkReloadFlag } from './lib/lazyRetry';
 import { supabase } from './lib/supabase';
 import * as taskRepo from './lib/taskRepo';
+import {
+  parseLocalDate, formatLocalDate, isoToBr,
+  formatDateBR, formatDateTimeLongCleanBR, formatDayMonthNumericBR,
+} from './lib/dates';
+import { ErrorSummary } from './components/ui/error-summary';
+import { DateFieldEditor } from './components/DateFieldEditor';
 import { isDoneLikeStatus, resolveDefaultStatus, getTaskCloseBlockReason, duplicateTask } from './lib/taskService';
 import { useDashboard } from './hooks/useDashboard';
 import { useTaskCountIndex } from './hooks/useTaskCountIndex';
 import { useUsers } from './hooks/useUsers';
 import { AutomationEngine, AutomationContext, AutomationCallbacks } from './lib/AutomationEngine';
-import { startVersionCheck, formatBuildTimeShort } from './lib/versionCheck';
+import { startVersionCheck, formatBuildTimeShort, type UpdateNotice } from './lib/versionCheck';
+import { NotificationBanner } from './components/ui/notification-banner';
 import { trackEnter, trackExit } from './lib/trackActivity';
 import { ssoToken, veioDoPortal } from './lib/ssoEntry';
 import { avatarThumb } from './lib/avatarUrl';
@@ -977,8 +984,11 @@ export default function App() {
 
   // Avisa quando uma nova versão foi publicada (deploy é um build estático,
   // sem invalidação — uma aba deixada aberta pode ficar rodando código
-  // antigo por muito tempo). Ver src/lib/versionCheck.ts.
-  useEffect(() => startVersionCheck(), []);
+  // antigo por muito tempo). Exibido como NotificationBanner (persistente,
+  // no fluxo do layout) em vez de toast — ver comentário em
+  // src/lib/versionCheck.ts sobre o bug que isso corrigiu.
+  const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
+  useEffect(() => startVersionCheck(setUpdateNotice), []);
 
   // App montou com sucesso: libera um novo reload automático caso um chunk de
   // uma view lazy de um deploy FUTURO também fique stale nesta mesma aba (ver
@@ -3705,6 +3715,12 @@ export default function App() {
   return (
     <SSOHandler>
       <Toaster richColors position="top-right" />
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[100] focus:rounded-md focus:bg-[var(--primary-color)] focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-white focus:shadow-lg"
+      >
+        Pular para o conteúdo principal
+      </a>
       <div
         className={`flex h-screen bg-background text-foreground font-sans selection:bg-[var(--primary-color)]/30 ${uiScaleClass}`}
         onClick={() => setIsUserMenuOpen(false)}
@@ -3758,10 +3774,24 @@ export default function App() {
 
         {/* Main Content */}
         <div className="flex-1 flex flex-col min-w-0 bg-muted">
+          {updateNotice && (
+            <NotificationBanner className="shrink-0" onDismiss={() => setUpdateNotice(null)}>
+              <span className="font-semibold">{updateNotice.message}</span>
+              <span className="mx-2 text-gray-400">·</span>
+              {updateNotice.description}
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="ml-3 font-semibold underline hover:no-underline"
+              >
+                Atualizar agora
+              </button>
+            </NotificationBanner>
+          )}
           {/* Header */}
           <header className="h-14 border-b bg-card flex items-center justify-between px-6 shrink-0 z-10">
             <div className="flex items-center gap-4">
-              <h1 className="text-lg font-bold text-gray-800 hidden md:block">
+              <h1 className="text-lg font-bold text-gray-800 sr-only md:not-sr-only md:block">
                 {activeListId ? (lists.find(l => l.id === activeListId)?.name ?? activeScope.name) : activeScope.name}
               </h1>
               <div className="relative">
@@ -4068,7 +4098,7 @@ export default function App() {
               tem efeito e a barra horizontal só aparece depois de milhares de linhas,
               lá no rodapé real da página). As outras views continuam usando o scroll
               de página normal do <main>. */}
-          <main className={`flex-1 custom-scrollbar ${activeView === 'Table' ? 'overflow-hidden flex flex-col' : 'overflow-auto p-4 sm:p-6'}`}>
+          <main id="main-content" tabIndex={-1} className={`flex-1 custom-scrollbar focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--primary-color)] ${activeView === 'Table' ? 'overflow-hidden flex flex-col' : 'overflow-auto p-4 sm:p-6'}`}>
           <div key={activeView} className={`animate-in fade-in slide-in-from-bottom-1 duration-200 ${activeView === 'Table' ? 'flex-1 min-h-0 flex flex-col' : ''}`}>
           <React.Suspense
             fallback={
@@ -4710,7 +4740,7 @@ function SpaceOverview({ space, folders, lists, listProgressMap, tasks, onNaviga
           </div>
         )}
         <div>
-          <h1 className="text-2xl font-bold text-foreground">{space.name}</h1>
+          <h2 className="text-2xl font-bold text-foreground">{space.name}</h2>
           <p className="text-sm text-muted-foreground">{folders.length} pasta{folders.length !== 1 ? 's' : ''} · {spaceLists.length} lista{spaceLists.length !== 1 ? 's' : ''} · {totalTasks} tarefa{totalTasks !== 1 ? 's' : ''}</p>
         </div>
       </div>
@@ -5144,7 +5174,7 @@ function DocView({ doc, allDocs = [], onUpdate, onSelectDoc, onCreateSubpage, cu
           onPaste={handlePaste}
           onClick={handleContentClick}
           dangerouslySetInnerHTML={{ __html: linkifyHtml(doc.content) }}
-          className="w-full min-h-[300px] text-xl text-gray-700 leading-relaxed outline-none prose prose-orange max-w-none focus:prose-orange [&_a]:text-blue-600 [&_a]:underline [&_a]:cursor-pointer hover:[&_a]:text-blue-800"
+          className="w-full min-h-[300px] text-xl text-gray-700 leading-relaxed outline-none prose prose-orange max-w-none rounded-lg focus:prose-orange focus:ring-2 focus:ring-orange-300 [&_a]:text-blue-600 [&_a]:underline [&_a]:cursor-pointer hover:[&_a]:text-blue-800"
         />
 
         {/* Subpáginas */}
@@ -6352,7 +6382,7 @@ function AllSpacesModal({ spaces, hiddenSpaceIds, onToggleHidden, onCreateSpace,
           <select
             value={sortBy}
             onChange={(e) => setSortBy(e.target.value as any)}
-            className="text-xs border rounded-md px-2 py-1.5 bg-gray-50 text-gray-600 focus:outline-none"
+            className="text-xs border rounded-md px-2 py-1.5 bg-gray-50 text-gray-600 focus:outline-none focus:ring-2 focus:ring-[var(--primary-color)]"
           >
             <option value="recommended">Recomendado</option>
             <option value="created">Data de criação</option>
@@ -6602,6 +6632,8 @@ function DuplicateTaskModal({
   );
 }
 
+// parseLocalDate / formatLocalDate agora vivem em ./lib/dates (issue #102,
+// achado 3) — importadas no topo deste arquivo.
 const WEEKDAY_LABELS = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
 const NTH_WEEK_LABELS: Record<number, string> = { 1: '1ª', 2: '2ª', 3: '3ª', 4: '4ª', 5: 'última' };
 
@@ -7229,26 +7261,6 @@ function HolidaysManagerModal({
       </DialogContent>
     </Dialog>
   );
-}
-
-// Datas de tarefa (dueDate/startDate) são strings "YYYY-MM-DD" (sem hora).
-// `new Date("YYYY-MM-DD")` interpreta isso como meia-noite UTC, que em fusos
-// atrás de UTC (ex: Brasil) cai no dia anterior ao formatar/comparar em
-// horário local. Parseamos os componentes manualmente para obter a
-// meia-noite local do dia correto.
-function parseLocalDate(dateStr: string): Date {
-  const [y, m, d] = dateStr.split('T')[0].split('-').map(Number);
-  return new Date(y, m - 1, d);
-}
-
-// Inverso de parseLocalDate: formata um Date usando os componentes locais
-// (ano/mês/dia), nunca `toISOString()` — que converte para UTC e pode
-// arredondar para o dia errado em fusos atrás de UTC (ex: Brasil, UTC-3).
-function formatLocalDate(date: Date): string {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
 }
 
 // Reexportado para não quebrar `import { linkifyText } from './App'` já em uso
@@ -8500,7 +8512,7 @@ function KanbanView({ tasks, onSelectTask, onStatusChange, onQuickUpdateTask, on
             className="h-8 w-full rounded-md border border-gray-200 bg-gray-50 pl-8 pr-3 text-xs outline-none transition focus:border-blue-300 focus:bg-white focus:ring-2 focus:ring-blue-100"
           />
         </div>
-        <select value={filterPriority} onChange={(e) => setFilterPriority(e.target.value)} className="h-8 rounded-md border border-gray-200 bg-white px-2 text-xs text-gray-600 outline-none">
+        <select value={filterPriority} onChange={(e) => setFilterPriority(e.target.value)} className="h-8 rounded-md border border-gray-200 bg-white px-2 text-xs text-gray-600 outline-none focus:border-blue-300 focus:ring-2 focus:ring-blue-100">
           <option value="">Prioridade</option>
           {Object.values(TaskPriority).map(priority => <option key={priority} value={priority}>{priority}</option>)}
         </select>
@@ -8738,7 +8750,7 @@ function KanbanView({ tasks, onSelectTask, onStatusChange, onQuickUpdateTask, on
                               <select value={quickDraft.priority} onChange={(e) => setQuickDraft({ ...quickDraft, priority: e.target.value as TaskPriority })} className="h-8 rounded-md border border-gray-200 bg-white px-2 text-xs">
                                 {Object.values(TaskPriority).map(priority => <option key={priority} value={priority}>{priority}</option>)}
                               </select>
-                              <input type="date" value={quickDraft.dueDate || ''} onChange={(e) => setQuickDraft({ ...quickDraft, dueDate: e.target.value })} className="h-8 rounded-md border border-gray-200 bg-white px-2 text-xs" />
+                              <DateFieldEditor value={quickDraft.dueDate || ''} onCommit={(v) => setQuickDraft({ ...quickDraft, dueDate: v })} className="h-8 rounded-md border border-gray-200 bg-white px-2 text-xs" ariaLabel="Prazo" />
                             </div>
                             <select value={quickDraft.mainAssigneeId} onChange={(e) => setQuickDraft({ ...quickDraft, mainAssigneeId: e.target.value })} className="h-8 w-full rounded-md border border-gray-200 bg-white px-2 text-xs">
                               {availableUsers.map((user: User) => <option key={user.id} value={user.id}>{user.name}</option>)}
@@ -9217,7 +9229,7 @@ function DashboardView({ tasks, users, statusGroups, activeListId, lists, allLis
                   : (a.newValue || '').toLowerCase().includes('cancel') ? '#6b7280'
                   : '#f59e0b';
                 const dt = new Date(a.createdAt);
-                const label = dt.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+                const label = formatDayMonthNumericBR(dt);
                 return (
                   <div key={i} className="flex items-center gap-2 p-2 rounded-lg hover:bg-gray-50 transition-colors">
                     <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: statusColor }} />
@@ -9242,6 +9254,10 @@ function DashboardView({ tasks, users, statusGroups, activeListId, lists, allLis
   );
 }
 
+// ErrorSummary agora vive em ./components/ui/error-summary (issue #102 /
+// achado 8 da auditoria: extração progressiva de componentes autocontidos
+// pra fora deste arquivo) — importado no topo.
+
 function CreateTaskModal({ onClose, onCreate, users, spaces, folders, lists, initialScope, activeListId, currentUser, prefilledData, additionalTasks, statusGroups }: any) {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -9254,6 +9270,7 @@ function CreateTaskModal({ onClose, onCreate, users, spaces, folders, lists, ini
   const [duration, setDuration] = useState('');
   const [dueDate, setDueDate] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitErrors, setSubmitErrors] = useState<{ id: string; message: string }[]>([]);
   const todayLabel = new Date().toLocaleDateString('pt-BR');
 
   // Esc fecha este modal (não tinha nenhum jeito de fechar por teclado antes).
@@ -9408,26 +9425,23 @@ function CreateTaskModal({ onClose, onCreate, users, spaces, folders, lists, ini
     // cliques são ignorados (evita criar a mesma tarefa várias vezes).
     if (isSubmitting) return;
 
-    if (!title.trim()) {
-      toast.error('Informe o nome da tarefa.');
-      return;
-    }
-
-    if (durationError) {
-      toast.error(durationError);
-      return;
-    }
-
+    // Junta todos os erros de uma vez (em vez de parar no primeiro) para
+    // alimentar o Error Summary — o usuário vê e corrige tudo numa só volta.
+    const errors: { id: string; message: string }[] = [];
+    if (!title.trim()) errors.push({ id: 'task-title', message: 'Informe o nome da tarefa.' });
+    if (durationError) errors.push({ id: 'task-duration', message: durationError });
     // Se uma pasta foi escolhida mas não existe lista, direcionamos o usuário a criar uma lista primeiro.
     if (selectedFolderId && availableLists.length === 0) {
-      toast.error('Esta pasta ainda não tem listas. Crie uma lista na sidebar e depois crie a tarefa.');
-      return;
+      errors.push({ id: 'task-folder', message: 'Esta pasta ainda não tem listas. Crie uma lista na sidebar e depois crie a tarefa.' });
+    } else if (!selectedListId) {
+      errors.push({ id: 'task-list', message: 'Selecione um Espaço, Pasta e Lista antes de criar a tarefa.' });
     }
 
-    if (!selectedListId) {
-      toast.error('Selecione um Espaço, Pasta e Lista antes de criar a tarefa.');
+    if (errors.length > 0) {
+      setSubmitErrors(errors);
       return;
     }
+    setSubmitErrors([]);
 
     setIsSubmitting(true);
     try {
@@ -9470,6 +9484,7 @@ function CreateTaskModal({ onClose, onCreate, users, spaces, folders, lists, ini
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 custom-scrollbar space-y-6">
+          <ErrorSummary errors={submitErrors} />
           {/* Hierarchy Selection */}
           <div className={`grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl border ${!selectedListId ? 'bg-amber-50 border-amber-200' : 'bg-gray-50 border-gray-100'}`}>
             {!selectedListId && (
@@ -9494,6 +9509,7 @@ function CreateTaskModal({ onClose, onCreate, users, spaces, folders, lists, ini
             <div>
               <label className={`text-xs font-bold uppercase ${selectedSpaceId && !selectedFolderId ? 'text-amber-600' : 'text-gray-400'}`}>Pasta *</label>
               <select
+                id="task-folder"
                 required
                 aria-required="true"
                 className={`w-full p-2 border rounded mt-1 text-sm bg-white focus:ring-2 focus:ring-[var(--primary-color)] outline-none ${selectedSpaceId && !selectedFolderId ? 'border-amber-300' : ''}`}
@@ -9508,6 +9524,7 @@ function CreateTaskModal({ onClose, onCreate, users, spaces, folders, lists, ini
             <div className="sm:col-span-2">
               <label className={`text-xs font-bold uppercase ${selectedFolderId && !selectedListId ? 'text-amber-600' : 'text-gray-400'}`}>Lista *</label>
               <select
+                id="task-list"
                 required
                 aria-required="true"
                 className={`w-full p-2 border rounded mt-1 text-sm bg-white focus:ring-2 focus:ring-[var(--primary-color)] outline-none ${selectedFolderId && !selectedListId ? 'border-amber-300' : ''}`}
@@ -9525,6 +9542,7 @@ function CreateTaskModal({ onClose, onCreate, users, spaces, folders, lists, ini
             <div>
               <label className="text-xs font-bold text-gray-400 uppercase">Nome da Tarefa *</label>
               <input
+                id="task-title"
                 type="text"
                 required
                 aria-required="true"
@@ -9618,6 +9636,7 @@ function CreateTaskModal({ onClose, onCreate, users, spaces, folders, lists, ini
                 <div>
                   <label className="text-xs font-bold text-gray-400 uppercase">Duração (dias ou horas)</label>
                   <input
+                    id="task-duration"
                     type="text"
                     placeholder="Ex: 5 ou 3h"
                     aria-invalid={!!durationError}
@@ -9828,7 +9847,15 @@ function TaskDetailModal(props: any) {
         id: 'creation',
         unifiedType: 'CREATION',
         date: task.createdAt,
-        text: creator ? `${creator} criou esta tarefa` : 'Tarefa criada'
+        text: creator ? `${creator} criou esta tarefa` : 'Tarefa importada',
+        // Tarefas sem created_by não passaram pelo fluxo normal de criação do
+        // app — foram inseridas direto no banco por uma migração/import.
+        // Confirmado por auditoria em 2026-09-03 (issue #102, achado 2): o
+        // created_at delas bate com o horário do import (picos de milhares de
+        // tarefas no mesmo minuto, timestamps redondos), não com a criação
+        // real. Mostrar essa data como "criada em" seria inventar precisão
+        // que não existe — o timeline mostra o rótulo sem data nesse caso.
+        dateUnreliable: !creator,
       });
     }
     return all.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
@@ -9872,23 +9899,16 @@ function TaskDetailModal(props: any) {
     ).length;
     const extensions = (task.extensionHistory || []).length;
     const comments = (task.comments || []).length;
-    const daysOpen = task.createdAt
+    // Tarefas importadas (sem created_by, ver comentário na timeline acima)
+    // têm created_at igual à data do import, não da criação real — "aberta
+    // há N dias" contado a partir daí mentiria sobre a idade da tarefa.
+    const daysOpen = task.createdAt && task.createdBy
       ? Math.max(0, Math.floor((Date.now() - new Date(task.createdAt).getTime()) / 86400000))
       : null;
     return { statusChanges, priorityChanges, assigneeChanges, extensions, comments, daysOpen };
-  }, [task.activities, task.extensionHistory, task.comments, task.createdAt]);
+  }, [task.activities, task.extensionHistory, task.comments, task.createdAt, task.createdBy]);
 
-  const formatDate = (date: string) => {
-    if (!date) return '';
-    const d = new Date(date);
-    return d.toLocaleString('pt-BR', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    }).replace(' de ', ' ').replace('.', '');
-  };
+  const formatDate = formatDateTimeLongCleanBR;
 
   const taskCustomFields = useMemo(() => {
     // Respeita os campos ocultados por lista (toggles de "Adicionar um
@@ -10205,8 +10225,8 @@ function TaskDetailModal(props: any) {
             context={[
               `Título: ${task.title}`,
               `Status: ${task.status} | Prioridade: ${task.priority}`,
-              task.startDate ? `Início: ${parseLocalDate(task.startDate).toLocaleDateString('pt-BR')}` : '',
-              task.dueDate ? `Prazo: ${parseLocalDate(task.dueDate).toLocaleDateString('pt-BR')}` : '',
+              task.startDate ? `Início: ${formatDateBR(task.startDate)}` : '',
+              task.dueDate ? `Prazo: ${formatDateBR(task.dueDate)}` : '',
               `Responsável: ${users?.find((u: User) => u.id === task.mainAssigneeId)?.name || 'Sem responsável'}`,
               (task.secondaryAssigneeIds || []).length > 0
                 ? `Acompanhantes: ${(task.secondaryAssigneeIds || []).map((id: string) => users?.find((u: User) => u.id === id)?.name).filter(Boolean).join(', ')}`
@@ -10360,8 +10380,8 @@ function TaskDetailModal(props: any) {
                       <p className={`text-sm font-semibold ${h.text}`}>{name} está: {h.label}</p>
                       {task.dueDate && (
                         <p className={`text-xs mt-0.5 ${h.text} opacity-75`}>
-                          Prazo: {parseLocalDate(task.dueDate).toLocaleDateString('pt-BR')}
-                          {task.startDate && ` · Início: ${parseLocalDate(task.startDate).toLocaleDateString('pt-BR')}`}
+                          Prazo: {formatDateBR(task.dueDate)}
+                          {task.startDate && ` · Início: ${formatDateBR(task.startDate)}`}
                         </p>
                       )}
                     </div>
@@ -10765,7 +10785,7 @@ function TaskDetailModal(props: any) {
                         </div>
                         <div className="flex-1 min-w-0">
                           <p className="text-sm font-bold text-gray-900 truncate">{linkifyText(attachment.name)}</p>
-                          <p className="text-[10px] text-gray-500">{formatFileSize(attachment.size)} • {new Date(attachment.uploadedAt).toLocaleDateString()}</p>
+                          <p className="text-[10px] text-gray-500">{formatFileSize(attachment.size)} • {formatDateBR(attachment.uploadedAt)}</p>
                         </div>
                         <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                           <a href={attachment.url} target="_blank" rel="noopener noreferrer" className="p-2 hover:bg-white rounded-lg text-gray-400 hover:text-gray-600 transition-colors">
@@ -10918,7 +10938,13 @@ function TaskDetailModal(props: any) {
                         <div className="absolute -left-[22px] top-1.5 w-2 h-2 rounded-full bg-gray-200 border-2 border-white shadow-sm"></div>
                         <div className="text-xs">
                           <span className="text-gray-500">{item.text}</span>
-                          <span className="text-gray-300 ml-2">{formatDate(item.date)}</span>
+                          {item.dateUnreliable ? (
+                            <span className="text-gray-300 ml-2" title="Tarefa migrada de outro sistema — a data de criação original não está disponível.">
+                              (data de criação original indisponível)
+                            </span>
+                          ) : (
+                            <span className="text-gray-300 ml-2">{formatDate(item.date)}</span>
+                          )}
                         </div>
                       </div>
                     );
@@ -11782,99 +11808,9 @@ function CreateFolderModal({ onClose, onCreate }: any) {
   );
 }
 
-// Input de data para campos personalizados/tabela. Inputs nativos <input
-// type="date"> disparam onChange a cada tecla digitada, inclusive enquanto
-// a data está incompleta (ex: só o dia e mês, ou só 1-2 dígitos do ano) —
-// nesses casos `e.target.value` vem vazio. Sem tratamento isso causava dois
-// problemas: (1) cada tecla parcial disparava um upsert salvando valor
-// vazio, criando uma corrida entre requisições que podia sobrescrever a
-// data completa digitada por último com uma parcial que resolveu depois;
-// (2) como o valor exibido é controlado pela prop `value` (só atualizada
-// depois que o upsert assíncrono termina), qualquer re-render do app nesse
-// intervalo (ex: outra tarefa mudando via realtime) forçava o campo de
-// volta ao valor antigo, apagando visualmente o que o usuário tinha
-// acabado de digitar — exatamente o sintoma relatado de "a data não fica
-// gravada assim que termino de digitar o ano". Por isso: (a) mantemos um
-// valor local que não depende do round-trip de rede para continuar exibindo
-// o que foi digitado, e (b) só disparamos onCommit quando o usuário termina
-// uma data válida ou explicitamente limpa um valor que já existia.
-// ISO 'YYYY-MM-DD' (formato de armazenamento) → 'dd/mm/aaaa' (exibição pt-BR).
-function isoToBr(iso: string): string {
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(iso || '');
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : '';
-}
-
-// 'dd/mm/aaaa' → ISO 'YYYY-MM-DD'. Retorna '' se a data estiver incompleta ou
-// for inválida (ex: 31/02) — assim só persistimos datas completas e reais.
-function brToIso(br: string): string {
-  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec((br || '').trim());
-  if (!m) return '';
-  const dd = Number(m[1]), mo = Number(m[2]), yyyy = Number(m[3]);
-  if (mo < 1 || mo > 12 || dd < 1 || dd > 31) return '';
-  const dt = new Date(yyyy, mo - 1, dd);
-  if (dt.getFullYear() !== yyyy || dt.getMonth() !== mo - 1 || dt.getDate() !== dd) return '';
-  return `${m[3]}-${m[2]}-${m[1]}`;
-}
-
-// Aplica a máscara dd/mm/aaaa a uma sequência crua de dígitos.
-function maskBrDate(raw: string): string {
-  const d = (raw || '').replace(/\D/g, '').slice(0, 8);
-  if (d.length > 4) return `${d.slice(0, 2)}/${d.slice(2, 4)}/${d.slice(4)}`;
-  if (d.length > 2) return `${d.slice(0, 2)}/${d.slice(2)}`;
-  return d;
-}
-
-// Editor de data para campos personalizados/tabela. Exibe e aceita entrada
-// SEMPRE em dd/mm/aaaa — o <input type="date"> nativo formatava no locale do
-// NAVEGADOR (mostrava mm/dd/aaaa para muitos usuários, apesar da página ser
-// pt-BR). Aqui o texto é um input mascarado determinístico; o calendário nativo
-// continua disponível num input oculto acionado pelo botão (showPicker). O valor
-// persistido continua ISO 'YYYY-MM-DD'. O buffer local preserva o que foi
-// digitado independentemente do round-trip do upsert (ver histórico abaixo).
-export function DateFieldEditor({ value, onCommit, className }: { value: any; onCommit: (v: string) => void; className?: string }) {
-  const [text, setText] = useState(() => isoToBr(value ?? ''));
-  const pickerRef = useRef<HTMLInputElement>(null);
-  useEffect(() => { setText(isoToBr(value ?? '')); }, [value]);
-
-  const commitFromText = (raw: string) => {
-    const masked = maskBrDate(raw);
-    setText(masked);
-    if (masked === '') { if (value) onCommit(''); return; }
-    const iso = brToIso(masked);
-    if (iso) onCommit(iso); // só persiste data completa e válida
-  };
-
-  return (
-    <div className="relative">
-      <input
-        type="text"
-        inputMode="numeric"
-        placeholder="dd/mm/aaaa"
-        value={text}
-        onChange={(e) => commitFromText(e.target.value)}
-        className={`${className ?? ''} pr-9`}
-      />
-      <button
-        type="button"
-        tabIndex={-1}
-        aria-label="Abrir calendário"
-        onClick={() => pickerRef.current?.showPicker?.()}
-        className="absolute inset-y-0 right-0 flex items-center px-2 text-gray-400 hover:text-gray-600"
-      >
-        <Icons.Calendar className="h-4 w-4" />
-      </button>
-      <input
-        ref={pickerRef}
-        type="date"
-        value={value ?? ''}
-        onChange={(e) => { const v = e.target.value; setText(isoToBr(v)); if (v || value) onCommit(v); }}
-        tabIndex={-1}
-        aria-hidden="true"
-        className="sr-only absolute right-0 bottom-0"
-      />
-    </div>
-  );
-}
+// DateFieldEditor agora vive em ./components/DateFieldEditor (issue #102 /
+// achado 8 da auditoria: extração progressiva de componentes autocontidos
+// pra fora deste arquivo) — importado no topo.
 
 // Input de texto/número para campos personalizados/tabela. Mesmo problema do
 // DateFieldEditor, mas mais severo aqui: como o valor exibido dependia

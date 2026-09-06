@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { isToday, isYesterday } from 'date-fns';
 import { supabase } from '../../lib/supabase';
 import { avatarThumb } from '../../lib/avatarUrl';
+import { relativeTimeBR, dateGroupLabelBR, formatDateTimeShortBR } from '../../lib/dates';
 import { AppNotification, List, User } from '../../types';
 import {
   DropdownMenu,
@@ -78,27 +78,10 @@ function loadPrefs(userId: string): { groupBy: GroupBy; sortOrder: SortOrder; de
   return { groupBy: 'date', sortOrder: 'newest', density: 'comfortable' };
 }
 
-function relativeTime(date: string) {
-  const diffMs = Date.now() - new Date(date).getTime();
-  const min = Math.floor(diffMs / 60000);
-  if (min < 1) return 'agora';
-  if (min < 60) return `há ${min} min`;
-  const h = Math.floor(min / 60);
-  if (h < 24) return `há ${h}h`;
-  const d = Math.floor(h / 24);
-  if (d === 1) return 'ontem';
-  if (d < 7) return `há ${d} dias`;
-  return new Date(date).toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' });
-}
-
-function dateGroupLabel(date: string) {
-  const d = new Date(date);
-  if (isToday(d)) return 'Hoje';
-  if (isYesterday(d)) return 'Ontem';
-  const diffDays = Math.floor((Date.now() - d.getTime()) / 86400000);
-  if (diffDays < 7) return 'Esta semana';
-  return 'Mais antigas';
-}
+// relativeTime/dateGroupLabel agora vivem em lib/dates (issue #102, achado
+// 3 — antes duplicadas idênticas em Inbox e Respostas).
+const relativeTime = relativeTimeBR;
+const dateGroupLabel = dateGroupLabelBR;
 
 function isSnoozedActive(n: AppNotification) {
   return !!n.snoozedUntil && new Date(n.snoozedUntil) > new Date();
@@ -122,7 +105,7 @@ const SNOOZE_OPTIONS: { label: string; getDate: () => Date }[] = [
 ];
 
 function formatSnoozedUntil(d: string) {
-  return `volta ${new Date(d).toLocaleString('pt-BR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}`;
+  return `volta ${formatDateTimeShortBR(d)}`;
 }
 
 /**
@@ -340,7 +323,7 @@ export function InboxView({ currentUser, users, lists, onOpenTask, onOpenMeeting
     <div className="max-w-2xl mx-auto">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <h1 className="text-xl font-bold text-gray-800">Caixa de entrada</h1>
+          <h2 className="text-xl font-bold text-gray-800">Caixa de entrada</h2>
           {unreadCount > 0 && (
             <span className="bg-orange-100 text-orange-600 text-xs font-bold px-2 py-0.5 rounded-full">{unreadCount} não lida{unreadCount === 1 ? '' : 's'}</span>
           )}

@@ -1,17 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-
-const toastMessage = vi.fn();
-vi.mock("sonner", () => ({
-  toast: { message: (...args: any[]) => toastMessage(...args) },
-}));
-
 import { startVersionCheck } from "../lib/versionCheck";
 
 describe("startVersionCheck", () => {
+  let onUpdateAvailable: ReturnType<typeof vi.fn>;
+
   beforeEach(() => {
     vi.stubGlobal("__APP_BUILD_TIME__", "2026-07-21T10:00:00.000Z");
     vi.useFakeTimers();
-    toastMessage.mockClear();
+    onUpdateAvailable = vi.fn();
     localStorage.clear();
   });
 
@@ -29,16 +25,16 @@ describe("startVersionCheck", () => {
       }),
     );
 
-    const stop = startVersionCheck();
+    const stop = startVersionCheck(onUpdateAvailable);
     await vi.advanceTimersByTimeAsync(15_000);
 
-    expect(toastMessage).toHaveBeenCalledTimes(1);
-    expect(toastMessage.mock.calls[0][0]).toContain("21/07/2026");
-    expect(toastMessage.mock.calls[0][0]).toContain("09:30");
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
+    expect(onUpdateAvailable.mock.calls[0][0].message).toContain("21/07/2026");
+    expect(onUpdateAvailable.mock.calls[0][0].message).toContain("09:30");
 
     // Um novo ciclo não deve duplicar o aviso.
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
-    expect(toastMessage).toHaveBeenCalledTimes(1);
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
 
     stop();
   });
@@ -52,10 +48,10 @@ describe("startVersionCheck", () => {
       }),
     );
 
-    const stop = startVersionCheck();
+    const stop = startVersionCheck(onUpdateAvailable);
     await vi.advanceTimersByTimeAsync(15_000);
 
-    expect(toastMessage).not.toHaveBeenCalled();
+    expect(onUpdateAvailable).not.toHaveBeenCalled();
     stop();
   });
 
@@ -66,13 +62,13 @@ describe("startVersionCheck", () => {
       .mockResolvedValueOnce({ ok: true, json: async () => ({ buildTime: "2026-07-21T18:00:00.000Z", commit: "b" }) });
     vi.stubGlobal("fetch", fetchMock);
 
-    const stop = startVersionCheck();
+    const stop = startVersionCheck(onUpdateAvailable);
     await vi.advanceTimersByTimeAsync(15_000);
-    expect(toastMessage).not.toHaveBeenCalled();
+    expect(onUpdateAvailable).not.toHaveBeenCalled();
 
     Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
     document.dispatchEvent(new Event("visibilitychange"));
-    await vi.waitFor(() => expect(toastMessage).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(onUpdateAvailable).toHaveBeenCalledTimes(1));
 
     stop();
   });
@@ -86,17 +82,17 @@ describe("startVersionCheck", () => {
       }),
     );
 
-    const stopA = startVersionCheck();
+    const stopA = startVersionCheck(onUpdateAvailable);
     await vi.advanceTimersByTimeAsync(15_000);
-    expect(toastMessage).toHaveBeenCalledTimes(1);
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
     stopA();
 
     // Segunda instância independente (outra aba com sua própria variável
     // `notified`, ou um remount do componente) — não deve duplicar o aviso,
     // porque o localStorage já registra que esse buildTime foi avisado.
-    const stopB = startVersionCheck();
+    const stopB = startVersionCheck(onUpdateAvailable);
     await vi.advanceTimersByTimeAsync(15_000);
-    expect(toastMessage).toHaveBeenCalledTimes(1);
+    expect(onUpdateAvailable).toHaveBeenCalledTimes(1);
     stopB();
   });
 });

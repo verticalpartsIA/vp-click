@@ -45,6 +45,12 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { toast } from 'sonner';
+// DateFieldEditor exibe/edita SEMPRE em dd/mm/aaaa, independente do locale
+// do navegador — ao contrário de um <input type="date"> cru, que muda de
+// formato conforme o locale (dd/mm no navegador em pt-BR, mm/dd em en-US).
+// Ver issue #102, achado 1.
+import { DateFieldEditor } from '@/components/DateFieldEditor';
+import { parseLocalDate, formatDateBR } from '@/lib/dates';
 
 interface TableViewProps {
   tasks: Task[];
@@ -109,19 +115,12 @@ const PRIORITY_ORDER: Record<string, number> = {
   [TaskPriority.BAIXA]: 3,
 };
 
-const parseDate = (value?: string) => {
-  if (!value) return null;
-  const [datePart] = value.split('T');
-  const [year, month, day] = datePart.split('-').map(Number);
-  if (!year || !month || !day) return null;
-  return new Date(year, month - 1, day);
-};
+// parseLocalDate/formatDateBR agora vivem em lib/dates (issue #102, achado
+// 3) — mantemos aqui só o wrapper com guarda de nulo que isOverdue e o
+// filtro "próximos 7 dias" abaixo já esperam.
+const parseDate = (value?: string) => (value ? parseLocalDate(value) : null);
 
-const formatDate = (value?: string) => {
-  const date = parseDate(value);
-  if (!date) return '-';
-  return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric' });
-};
+const formatDate = (value?: string) => formatDateBR(value) || '-';
 
 const toInputDate = (value?: string) => value?.split('T')[0] || '';
 
@@ -607,7 +606,15 @@ export const TableView: React.FC<TableViewProps> = ({
       );
     }
     if (field.type === CustomFieldType.DATE) {
-      return <input type="date" value={toInputDate(value)} onClick={(e) => e.stopPropagation()} onChange={(e) => commitFieldUpdate(task.id, field.id, e.target.value)} className="h-8 w-full rounded border border-border bg-background px-2 text-xs" />;
+      return (
+        <span onClick={(e) => e.stopPropagation()}>
+          <DateFieldEditor
+            value={toInputDate(value)}
+            onCommit={(v) => commitFieldUpdate(task.id, field.id, v)}
+            className="h-8 w-full rounded border border-border bg-background px-2 text-xs"
+          />
+        </span>
+      );
     }
     if (field.type === CustomFieldType.PROGRESS) {
       return <input type="number" min={0} max={100} value={value ?? 0} onClick={(e) => e.stopPropagation()} onChange={(e) => commitFieldUpdate(task.id, field.id, Number(e.target.value))} className="h-8 w-full rounded border border-border bg-background px-2 text-xs" />;
@@ -675,7 +682,17 @@ export const TableView: React.FC<TableViewProps> = ({
     }
 
     if (column.id === 'dueDate') {
-      return <td key={column.id} className={baseClass} style={{ width, minWidth: width, maxWidth: width }}><input type="date" value={toInputDate(task.dueDate)} onClick={(e) => e.stopPropagation()} onChange={(e) => commitTaskUpdate(task.id, { dueDate: e.target.value })} className="h-8 w-full rounded border border-border bg-background px-2 text-xs" title={formatDate(task.dueDate)} /></td>;
+      return (
+        <td key={column.id} className={baseClass} style={{ width, minWidth: width, maxWidth: width }} title={formatDate(task.dueDate)}>
+          <span onClick={(e) => e.stopPropagation()}>
+            <DateFieldEditor
+              value={toInputDate(task.dueDate)}
+              onCommit={(v) => commitTaskUpdate(task.id, { dueDate: v })}
+              className="h-8 w-full rounded border border-border bg-background px-2 text-xs"
+            />
+          </span>
+        </td>
+      );
     }
 
     if (column.id === 'tags') {
@@ -884,7 +901,7 @@ export const TableView: React.FC<TableViewProps> = ({
           {onBulkStatusChange && <select defaultValue="" onChange={(e) => { if (!e.target.value) return; onBulkStatusChange(Array.from(selectedTaskIds), e.target.value); setSelectedTaskIds(new Set()); e.target.value = ''; }} className="h-8 rounded border border-white/20 bg-black/20 px-2 text-sm"><option value="" disabled>Status</option>{availableStatuses.map((status) => <option key={status} value={status}>{status}</option>)}</select>}
           {onBulkPriorityChange && <select defaultValue="" onChange={(e) => { if (!e.target.value) return; onBulkPriorityChange(Array.from(selectedTaskIds), e.target.value as TaskPriority); setSelectedTaskIds(new Set()); e.target.value = ''; }} className="h-8 rounded border border-white/20 bg-black/20 px-2 text-sm"><option value="" disabled>Prioridade</option>{PRIORITY_VALUES.map((priority) => <option key={priority} value={priority}>{priority}</option>)}</select>}
           <select defaultValue="" onChange={(e) => e.target.value && runBulkUpdate({ mainAssigneeId: e.target.value })} className="h-8 rounded border border-white/20 bg-black/20 px-2 text-sm"><option value="" disabled>Responsável</option>{users.map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select>
-          <input type="date" onChange={(e) => e.target.value && runBulkUpdate({ dueDate: e.target.value })} className="h-8 rounded border border-white/20 bg-black/20 px-2 text-sm" />
+          <DateFieldEditor value="" onCommit={(v) => v && runBulkUpdate({ dueDate: v })} className="h-8 rounded border border-white/20 bg-black/20 px-2 text-sm text-background" ariaLabel="Definir prazo para os selecionados" />
           <select defaultValue="" onChange={(e) => e.target.value && runBulkTagAdd(e.target.value)} className="h-8 rounded border border-white/20 bg-black/20 px-2 text-sm"><option value="" disabled>Tag</option>{availableTags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}</select>
           {onBulkMove && <select defaultValue="" onChange={(e) => { if (!e.target.value) return; onBulkMove(Array.from(selectedTaskIds), e.target.value); setSelectedTaskIds(new Set()); e.target.value = ''; }} className="h-8 rounded border border-white/20 bg-black/20 px-2 text-sm"><option value="" disabled>Mover</option>{lists.map((list) => <option key={list.id} value={list.id}>{list.name}</option>)}</select>}
           {(onBulkDelete || onDeleteTask) && <button type="button" onClick={() => { const ids = Array.from(selectedTaskIds); if (onBulkDelete) onBulkDelete(ids); else if (ids.length === 1 && onDeleteTask) onDeleteTask(ids[0]); setSelectedTaskIds(new Set()); }} className="rounded px-2 py-1 text-sm text-red-300 hover:bg-white/10">Excluir</button>}

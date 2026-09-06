@@ -1,5 +1,3 @@
-import { toast } from 'sonner';
-
 // Deploy é estático (build sobrescreve os arquivos direto no servidor, sem
 // invalidação de CDN/versionamento) — uma aba deixada aberta pode continuar
 // rodando o bundle antigo por horas/dias depois de uma atualização. Este
@@ -7,6 +5,15 @@ import { toast } from 'sonner';
 // plugin em vite.config.ts) e avisa o usuário quando uma versão mais nova
 // foi publicada, sem forçar o reload (evita perder algo que a pessoa esteja
 // digitando).
+//
+// O aviso é entregue via callback (NotificationBanner do chamador), não
+// mais como toast: um toast com duration:Infinity já causou um bug real
+// (achado de QA, ver histórico) de cobrir o botão "+ Criar" — um toast é
+// pensado pra ser transitório e flutuar por cima do conteúdo; a mensagem
+// "atualize a página" precisa persistir e não deveria competir por espaço
+// com o resto da UI. Padrão GOV.UK: "Notification banner" pra avisos
+// importantes e persistentes, "toast" (não-GOV.UK, mas equivalente ao que
+// já usávamos) só pra confirmações rápidas de uma ação.
 const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutos
 const FIRST_CHECK_DELAY_MS = 15 * 1000; // dá um tempo antes da primeira checagem
 const DISPLAY_TIME_ZONE = 'America/Sao_Paulo';
@@ -50,7 +57,7 @@ function formatUpdateMessage(buildTime: string): string {
 
 // Usado pela Sidebar pra mostrar "Última atualização: DD/MM/AA HH:MMh" —
 // data/hora do build desta aba (__APP_BUILD_TIME__), não a mais recente
-// publicada no servidor (essa é a que o toast acima avisa quando muda).
+// publicada no servidor (essa é a que o aviso de startVersionCheck cobre).
 export function formatBuildTimeShort(buildTime: string): string | null {
   const d = new Date(buildTime);
   if (isNaN(d.getTime())) return null;
@@ -59,7 +66,15 @@ export function formatBuildTimeShort(buildTime: string): string | null {
   return `${date} ${time}h`;
 }
 
-export function startVersionCheck(): () => void {
+export interface UpdateNotice {
+  message: string;
+  description: string;
+}
+
+// `onUpdateAvailable` é chamado quando uma versão nova é detectada; o
+// chamador decide como exibir (App.tsx renderiza um NotificationBanner
+// persistente — ver comentário no topo do arquivo).
+export function startVersionCheck(onUpdateAvailable: (notice: UpdateNotice) => void): () => void {
   let notified = false;
   const currentBuildTime = __APP_BUILD_TIME__;
 
@@ -76,23 +91,9 @@ export function startVersionCheck(): () => void {
         }
         notified = true;
         markNotified(info.buildTime);
-        toast.message(formatUpdateMessage(info.buildTime), {
+        onUpdateAvailable({
+          message: formatUpdateMessage(info.buildTime),
           description: 'Atualize a página para usar a versão mais recente.',
-          duration: Infinity,
-          action: {
-            label: 'Atualizar agora',
-            onClick: () => window.location.reload(),
-          },
-          // Sem isso o aviso (duration: Infinity) ficava preso na tela pra
-          // sempre — sem "X" nem outro jeito de dispensar — cobrindo o botão
-          // "+ Criar" da barra de abas até o usuário decidir recarregar
-          // (achado de QA). Dispensar aqui só fecha o toast; a versão nova
-          // já foi marcada como notificada (markNotified acima) e continua
-          // valendo na próxima visita/reload natural.
-          cancel: {
-            label: 'Depois',
-            onClick: () => {},
-          },
         });
       }
     } catch {
