@@ -317,6 +317,24 @@ export function fetchInitialTaskRowsByListIds(listIds: string[] | null): Promise
   return fetchTaskRowsRange(listIds, 0, INITIAL_TASK_PAGE_SIZE - 1, 'fetchInitialTaskRowsByListIds');
 }
 
+// Issue #185, gota 3 ("mostrar arquivadas"): mesmo escopo (listIds) das
+// consultas normais acima, só que o inverso de selectNormalTasks —
+// archived_at NÃO nulo, deleted_at nulo (uma tarefa na lixeira não aparece
+// aqui, ela terá sua própria view na gota da Lixeira). RLS (tasks_select)
+// já restringe às linhas que o usuário pode acessar.
+export function fetchArchivedTasksByListIds(listIds: string[] | null): Promise<TaskRow[]> {
+  return fetchAllPages<TaskRow>(
+    (from, to) => {
+      const q = supabase.from('tasks').select(TASK_ROW_SELECT).not('archived_at', 'is', null).is('deleted_at', null);
+      return (listIds ? q.in('list_id', listIds) : q)
+        .order('archived_at', { ascending: false })
+        .order('id', { ascending: true })
+        .range(from, to);
+    },
+    'fetchArchivedTasksByListIds',
+  );
+}
+
 export function fetchRemainingTaskRowsByListIds(listIds: string[] | null): Promise<TaskRow[]> {
   return fetchAllPages<TaskRow>(
     (from, to) => {

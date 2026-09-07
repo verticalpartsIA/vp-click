@@ -1888,7 +1888,23 @@ export default function App() {
   // é um visitante externo. Navegações POSTERIORES (voltar/avançar do
   // navegador) são tratadas pelo efeito de entrada logo após handleNavigate.
 
-  const selectedTask = useMemo(() => tasks.find(t => t.id === selectedTaskId), [tasks, selectedTaskId]);
+  // Issue #185, gota 3 ("mostrar arquivadas"): mantidas FORA de `tasks` de
+  // propósito — evita ter que filtrar tarefas arquivadas em cada view
+  // (Kanban/Calendário/Gantt/Tabela/Dashboard), que já não as recebem do
+  // servidor (loadTasks usa taskRepo.selectNormalTasks). Só carregadas sob
+  // demanda quando o painel de arquivadas é aberto (ver loadArchivedTasks).
+  const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
+  const [isArchivedPanelOpen, setIsArchivedPanelOpen] = useState(false);
+  const [isArchivedLoading, setIsArchivedLoading] = useState(false);
+
+  // Issue #185, gota 3: uma tarefa aberta a partir do painel "Tarefas
+  // arquivadas" não está em `tasks` (loadTasks já filtra archived_at) — sem
+  // este fallback, o efeito de "tarefa não existe mais" logo abaixo a fecharia
+  // na hora.
+  const selectedTask = useMemo(
+    () => tasks.find(t => t.id === selectedTaskId) ?? archivedTasks.find(t => t.id === selectedTaskId),
+    [tasks, archivedTasks, selectedTaskId],
+  );
 
   // Carrega a regra de recorrência da tarefa aberta (se houver) só pro
   // indicador visual no TaskDetailModal — não bloqueia a UI, chave ausente no
@@ -1920,12 +1936,17 @@ export default function App() {
   // e não dava nenhuma pista do porquê. `tasks.length > 0` evita um falso
   // positivo enquanto a lista ainda está carregando pela primeira vez.
   useEffect(() => {
-    if (selectedTaskId && isTasksFullyLoaded && !tasks.some(t => t.id === selectedTaskId)) {
+    if (
+      selectedTaskId
+      && isTasksFullyLoaded
+      && !tasks.some(t => t.id === selectedTaskId)
+      && !archivedTasks.some(t => t.id === selectedTaskId)
+    ) {
       toast.error('Essa tarefa não existe mais ou você não tem acesso a ela.');
       setSelectedTaskId(null);
       setTaskCommentFocus(null);
     }
-  }, [selectedTaskId, tasks, isTasksFullyLoaded]);
+  }, [selectedTaskId, tasks, archivedTasks, isTasksFullyLoaded]);
 
   // Resolve .../tarefa/<slug>-<8chars> (ver pendingTaskSlugId) assim que
   // `tasks` do escopo carregar por completo: acha a tarefa cujo id começa
@@ -2364,7 +2385,13 @@ export default function App() {
       const res = await taskRepo.archiveTask(task.id, currentUser.id);
       if (!res.ok) { toast.error('Erro ao arquivar tarefa: ' + res.message); return; }
       const archivedAt = new Date().toISOString();
-      setTasks(prev => prev.map(t => t.id === task.id ? { ...t, archivedAt, archivedBy: currentUser.id } : t));
+      const archived = { ...task, archivedAt, archivedBy: currentUser.id };
+      setTasks(prev => prev.map(t => t.id === task.id ? archived : t));
+      // Mantém o painel "Tarefas arquivadas" (gota 3) coerente sem precisar
+      // reabrir/recarregar, caso já esteja aberto.
+      setArchivedTasks(prev => prev.some(t => t.id === task.id)
+        ? prev.map(t => t.id === task.id ? archived : t)
+        : [archived, ...prev]);
       await taskRepo.insertActivity(task.id, currentUser.id, 'TASK_ARCHIVED');
       toast.success('Tarefa arquivada.');
     };
@@ -2383,10 +2410,33 @@ export default function App() {
   const handleUnarchiveTask = async (task: Task) => {
     const res = await taskRepo.unarchiveTask(task.id);
     if (!res.ok) { toast.error('Erro ao desarquivar tarefa: ' + res.message); return; }
-    setTasks(prev => prev.map(t => t.id === task.id ? { ...t, archivedAt: undefined, archivedBy: undefined } : t));
+    const unarchived = { ...task, archivedAt: undefined, archivedBy: undefined };
+    // A tarefa pode ter vindo do painel de arquivadas (gota 3) e nunca ter
+    // estado em `tasks` (loadTasks já filtra archived_at) — adiciona em vez
+    // de só mapear, senão desarquivar por lá não reflete em lugar nenhum.
+    setTasks(prev => prev.some(t => t.id === task.id)
+      ? prev.map(t => t.id === task.id ? unarchived : t)
+      : [...prev, unarchived]);
+    setArchivedTasks(prev => prev.filter(t => t.id !== task.id));
     await taskRepo.insertActivity(task.id, currentUser.id, 'TASK_UNARCHIVED');
     toast.success('Tarefa desarquivada.');
   };
+
+  // Issue #185, gota 3: carrega sob demanda (só quando o painel abre), no
+  // mesmo escopo (lista/pasta/espaço ativo) que loadTasks usa pra tarefas
+  // normais — ver scopedListIds acima.
+  const loadArchivedTasks = useCallback(async () => {
+    setIsArchivedLoading(true);
+    try {
+      const rows = await taskRepo.fetchArchivedTasksByListIds(activeListId ? [activeListId] : scopedListIds);
+      setArchivedTasks(rows.map(taskRepo.mapRowToTaskShell));
+    } catch (err) {
+      console.error('Erro ao carregar tarefas arquivadas:', err);
+      toast.error('Não foi possível carregar as tarefas arquivadas.');
+    } finally {
+      setIsArchivedLoading(false);
+    }
+  }, [activeListId, scopedListIds]);
 
   const handleDeleteSpace = (spaceId: string) => {
     // Bloquear exclusão de spaces nativos do Hub de Integrações
@@ -4071,6 +4121,15 @@ export default function App() {
                     <Icons.Zap className="w-3.5 h-3.5 text-yellow-500" /> Automações
                   </button>
                 )}
+                {activeScope.type !== 'global' && (
+                  <button
+                    onClick={() => { setIsArchivedPanelOpen(true); loadArchivedTasks(); }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border border-gray-200 bg-white hover:bg-amber-50 text-gray-600 hover:text-amber-700 transition-colors font-medium whitespace-nowrap"
+                    title="Ver tarefas arquivadas deste escopo"
+                  >
+                    <ArchiveIcon className="w-3.5 h-3.5" /> Arquivadas
+                  </button>
+                )}
                 <div className="flex-1" />
                 <button
                   onClick={() => setIsTaskModalOpen(true)}
@@ -4595,6 +4654,19 @@ export default function App() {
             variant={confirmModal.variant}
             onConfirm={() => { confirmModal.onConfirm(); setConfirmModal(null); }}
             onClose={() => setConfirmModal(null)}
+          />
+        )}
+
+        {/* Issue #185, gota 3 — painel "Tarefas arquivadas" */}
+        {isArchivedPanelOpen && (
+          <ArchivedTasksModal
+            isLoading={isArchivedLoading}
+            tasks={archivedTasks}
+            lists={lists}
+            users={adminUsers}
+            onClose={() => setIsArchivedPanelOpen(false)}
+            onOpenTask={(taskId) => { setSelectedTaskId(taskId); setIsArchivedPanelOpen(false); }}
+            onUnarchive={handleUnarchiveTask}
           />
         )}
       </div>
@@ -6492,6 +6564,90 @@ function ConfirmModal({
           >
             {confirmLabel}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Issue #185, gota 3 ("mostrar arquivadas"): fecha o loop aberto pela gota 2
+// — sem isso, arquivar uma tarefa era uma ação sem volta prática pela UI (só
+// um admin mexendo direto no banco conseguia desarquivar). Painel simples e
+// separado do ListView (que já é complexo — seleção em massa, agrupamento por
+// status) de propósito: aqui é só achar a tarefa e Abrir/Desarquivar.
+function ArchivedTasksModal({
+  isLoading,
+  tasks,
+  lists,
+  users,
+  onClose,
+  onOpenTask,
+  onUnarchive,
+}: {
+  isLoading: boolean;
+  tasks: Task[];
+  lists: List[];
+  users: any[];
+  onClose: () => void;
+  onOpenTask: (taskId: string) => void;
+  onUnarchive: (task: Task) => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-6 py-4 border-b">
+          <div className="flex items-center gap-2">
+            <ArchiveIcon className="w-4 h-4 text-amber-600" />
+            <p className="font-semibold text-gray-800 text-sm">Tarefas arquivadas neste escopo</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-auto custom-scrollbar p-4">
+          {isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <div className="w-6 h-6 border-2 border-gray-200 border-t-amber-500 rounded-full animate-spin" />
+            </div>
+          ) : tasks.length === 0 ? (
+            <p className="text-sm text-gray-500 text-center py-12">Nenhuma tarefa arquivada neste escopo.</p>
+          ) : (
+            <div className="flex flex-col gap-1">
+              {tasks.map(task => {
+                const list = lists.find(l => l.id === task.listId);
+                const archivedByName = users.find((u: any) => u.id === task.archivedBy)?.name;
+                return (
+                  <div
+                    key={task.id}
+                    className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg border border-transparent hover:bg-amber-50/50 hover:border-amber-100 transition-colors"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-gray-800 truncate">{task.title}</p>
+                      <p className="text-xs text-gray-500 truncate">
+                        {list?.name ? `${list.name} · ` : ''}
+                        Arquivada {task.archivedAt ? new Date(task.archivedAt).toLocaleDateString('pt-BR') : ''}
+                        {archivedByName ? ` por ${archivedByName}` : ''}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => onOpenTask(task.id)}
+                        className="px-2.5 py-1 text-xs rounded-md border text-gray-600 hover:bg-gray-50"
+                      >
+                        Abrir
+                      </button>
+                      <button
+                        onClick={() => onUnarchive(task)}
+                        className="px-2.5 py-1 text-xs rounded-md bg-amber-500 hover:bg-amber-600 text-white font-medium"
+                      >
+                        Desarquivar
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
     </div>
