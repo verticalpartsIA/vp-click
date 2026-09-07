@@ -244,13 +244,23 @@ async function fetchAllPages<T>(
   return all;
 }
 
+// Ponto único da cláusula "tarefa normal" (issue #185 seção 29): toda
+// consulta de VIEW comum (Lista/Kanban/Tabela/Calendário/Gantt/Minhas
+// Tarefas/busca) passa por aqui, pra nunca esquecer de esconder arquivadas/
+// lixeira em algum caminho novo. Abrir uma tarefa específica por id
+// (fetchTaskDetails) NÃO usa isso — precisa continuar acessível pra
+// desarquivar/restaurar mesmo estando fora das views normais.
+function selectNormalTasks() {
+  return supabase.from('tasks').select(TASK_ROW_SELECT).is('archived_at', null).is('deleted_at', null);
+}
+
 async function fetchTaskRowsRange(
   listIds: string[] | null,
   from: number,
   to: number,
   label: string,
 ): Promise<TaskRow[]> {
-  const q = supabase.from('tasks').select(TASK_ROW_SELECT);
+  const q = selectNormalTasks();
   const { data, error } = await (listIds ? q.in('list_id', listIds) : q)
     .order('created_at', { ascending: false })
     .order('id', { ascending: true })
@@ -269,9 +279,7 @@ async function fetchTaskRowsBySingleListRange(
   to: number,
   label: string,
 ): Promise<TaskRow[]> {
-  const { data, error } = await supabase
-    .from('tasks')
-    .select(TASK_ROW_SELECT)
+  const { data, error } = await selectNormalTasks()
     .eq('list_id', listId)
     .order('created_at', { ascending: false })
     .order('id', { ascending: true })
@@ -289,7 +297,7 @@ async function fetchTaskRowsBySingleListRange(
 export function fetchTaskRowsByListIds(listIds: string[] | null): Promise<TaskRow[]> {
   return fetchAllPages<TaskRow>(
     (from, to) => {
-      const q = supabase.from('tasks').select(TASK_ROW_SELECT);
+      const q = selectNormalTasks();
       return (listIds ? q.in('list_id', listIds) : q)
         .order('created_at', { ascending: false })
         .order('id', { ascending: true })
@@ -298,7 +306,7 @@ export function fetchTaskRowsByListIds(listIds: string[] | null): Promise<TaskRo
     'fetchTaskRowsByListIds',
     0,
     async () => {
-      const q = supabase.from('tasks').select('id', { count: 'exact', head: true });
+      const q = supabase.from('tasks').select('id', { count: 'exact', head: true }).is('archived_at', null).is('deleted_at', null);
       const { count, error } = await (listIds ? q.in('list_id', listIds) : q);
       return { count, error };
     },
@@ -312,7 +320,7 @@ export function fetchInitialTaskRowsByListIds(listIds: string[] | null): Promise
 export function fetchRemainingTaskRowsByListIds(listIds: string[] | null): Promise<TaskRow[]> {
   return fetchAllPages<TaskRow>(
     (from, to) => {
-      const q = supabase.from('tasks').select(TASK_ROW_SELECT);
+      const q = selectNormalTasks();
       return (listIds ? q.in('list_id', listIds) : q)
         .order('created_at', { ascending: false })
         .order('id', { ascending: true })
@@ -321,7 +329,7 @@ export function fetchRemainingTaskRowsByListIds(listIds: string[] | null): Promi
     'fetchRemainingTaskRowsByListIds',
     INITIAL_TASK_PAGE_SIZE,
     async () => {
-      const q = supabase.from('tasks').select('id', { count: 'exact', head: true });
+      const q = supabase.from('tasks').select('id', { count: 'exact', head: true }).is('archived_at', null).is('deleted_at', null);
       const { count, error } = await (listIds ? q.in('list_id', listIds) : q);
       return { count, error };
     },
@@ -332,9 +340,7 @@ export function fetchRemainingTaskRowsByListIds(listIds: string[] | null): Promi
 // explícita em list_id = X para o Postgres usar o índice mais direto possível.
 export function fetchTaskRowsByListId(listId: string): Promise<TaskRow[]> {
   return fetchAllPages<TaskRow>(
-    (from, to) => supabase
-      .from('tasks')
-      .select(TASK_ROW_SELECT)
+    (from, to) => selectNormalTasks()
       .eq('list_id', listId)
       .order('created_at', { ascending: false })
       .order('id', { ascending: true })
@@ -345,6 +351,8 @@ export function fetchTaskRowsByListId(listId: string): Promise<TaskRow[]> {
       const { count, error } = await supabase
         .from('tasks')
         .select('id', { count: 'exact', head: true })
+        .is('archived_at', null)
+        .is('deleted_at', null)
         .eq('list_id', listId);
       return { count, error };
     },
@@ -357,9 +365,7 @@ export function fetchInitialTaskRowsByListId(listId: string): Promise<TaskRow[]>
 
 export function fetchRemainingTaskRowsByListId(listId: string): Promise<TaskRow[]> {
   return fetchAllPages<TaskRow>(
-    (from, to) => supabase
-      .from('tasks')
-      .select(TASK_ROW_SELECT)
+    (from, to) => selectNormalTasks()
       .eq('list_id', listId)
       .order('created_at', { ascending: false })
       .order('id', { ascending: true })
@@ -370,6 +376,8 @@ export function fetchRemainingTaskRowsByListId(listId: string): Promise<TaskRow[
       const { count, error } = await supabase
         .from('tasks')
         .select('id', { count: 'exact', head: true })
+        .is('archived_at', null)
+        .is('deleted_at', null)
         .eq('list_id', listId);
       return { count, error };
     },
@@ -378,9 +386,7 @@ export function fetchRemainingTaskRowsByListId(listId: string): Promise<TaskRow[
 
 export function fetchMyTaskRows(userId: string): Promise<TaskRow[]> {
   return fetchAllPages<TaskRow>(
-    (from, to) => supabase
-      .from('tasks')
-      .select(TASK_ROW_SELECT)
+    (from, to) => selectNormalTasks()
       .or(`main_assignee_id.eq.${userId},secondary_assignee_ids.cs.{${userId}},created_by.eq.${userId}`)
       .order('due_date', { ascending: true, nullsFirst: false })
       .order('created_at', { ascending: false })
@@ -401,7 +407,7 @@ async function fetchTaskCountIndexFallback(listIds: string[] | null = null): Pro
   if (listIds && listIds.length === 0) return [];
   const rows = await fetchAllPages<CountRow>(
     (from, to) => {
-      const q = supabase.from('tasks').select('id, list_id, status');
+      const q = supabase.from('tasks').select('id, list_id, status').is('archived_at', null).is('deleted_at', null);
       return (listIds ? q.in('list_id', listIds) : q)
         .order('list_id', { ascending: true, nullsFirst: true })
         .order('status', { ascending: true })
@@ -515,9 +521,7 @@ export async function searchTaskRowsByTitle(term: string, limit = 200): Promise<
   if (!rpcError) return (rpcData || []) as TaskRow[];
   console.warn('taskRepo.searchTaskRowsByTitle: fallback sem RPC:', rpcError);
 
-  const { data, error } = await supabase
-    .from('tasks')
-    .select(TASK_ROW_SELECT)
+  const { data, error } = await selectNormalTasks()
     .ilike('title', pattern)
     .limit(limit);
   if (error) { console.error('taskRepo.searchTaskRowsByTitle: erro na busca:', error); return []; }
@@ -710,6 +714,28 @@ export async function updateTaskFields(task: Task): Promise<{ ok: true } | { ok:
       is_milestone: task.isMilestone ?? false,
     })
     .eq('id', task.id);
+  if (error) return { ok: false, message: error.message };
+  return { ok: true };
+}
+
+// Issue #185, gota 2 — arquivar/desarquivar. Dimensão independente do
+// `status` (nunca mexe nele): só marca/limpa archived_at/archived_by. RLS
+// (tasks_upd) já cobre quem pode chamar isto — mesma permissão de editar a
+// tarefa, como pede a seção 23 da issue pra COLABORADOR.
+export async function archiveTask(taskId: string, userId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  const { error } = await supabase
+    .from('tasks')
+    .update({ archived_at: new Date().toISOString(), archived_by: userId })
+    .eq('id', taskId);
+  if (error) return { ok: false, message: error.message };
+  return { ok: true };
+}
+
+export async function unarchiveTask(taskId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  const { error } = await supabase
+    .from('tasks')
+    .update({ archived_at: null, archived_by: null })
+    .eq('id', taskId);
   if (error) return { ok: false, message: error.message };
   return { ok: true };
 }
@@ -1191,7 +1217,9 @@ export async function fetchDashboardData(listIds: string[] | null): Promise<{ ta
   let taskQuery = supabase
     .from('tasks')
     .select('id, title, status, priority, main_assignee_id, start_date, due_date, extension_count, list_id, created_at')
-    .in('id', taskIds);
+    .in('id', taskIds)
+    .is('archived_at', null)
+    .is('deleted_at', null);
   if (listIds) taskQuery = taskQuery.in('list_id', listIds);
   const { data: rowsData, error } = await taskQuery;
   if (error) {

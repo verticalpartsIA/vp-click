@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useNavigate, useLocation, useNavigationType, useSearchParams } from 'react-router-dom';
-import { MoreHorizontal, FileText, ListPlus, Link as LinkIcon, Image as ImageIcon, Paperclip, AlertTriangle as AlertTriangleIcon, Tag, Copy, ArrowUpDown, Search, Filter, RotateCcw, Check, X, Edit3, CalendarDays, UserCircle, Flag, MessageSquare, CheckSquare, GripVertical, Repeat, Pause, Play } from "lucide-react";
+import { MoreHorizontal, FileText, ListPlus, Link as LinkIcon, Image as ImageIcon, Paperclip, AlertTriangle as AlertTriangleIcon, Tag, Copy, ArrowUpDown, Search, Filter, RotateCcw, Check, X, Edit3, CalendarDays, UserCircle, Flag, MessageSquare, CheckSquare, GripVertical, Repeat, Pause, Play, Archive as ArchiveIcon } from "lucide-react";
 import {
   User, Task, Workspace, Space, Folder, List, Project,
   UserRole, StatusType, StatusOption, StatusGroup, TaskPriority, ExtensionLog, Comment, ChecklistItem, Attachment,
@@ -1549,7 +1549,7 @@ export default function App() {
 
   // --- Inline Rename / Confirm modal state ---
   const [renameModal, setRenameModal] = useState<{ title: string; defaultValue: string; placeholder?: string; onSubmit: (v: string) => void } | null>(null);
-  const [confirmModal, setConfirmModal] = useState<{ message: string; onConfirm: () => void } | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{ message: string; onConfirm: () => void; confirmLabel?: string; variant?: 'danger' | 'warning' } | null>(null);
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -2351,6 +2351,41 @@ export default function App() {
         } else { toast.error('Erro ao excluir tarefa: ' + res.message); }
       }
     });
+  };
+
+  // Issue #185, gota 2 — arquivar/desarquivar. Dimensão independente do
+  // status (seção 1 da issue): NUNCA muda `status` aqui. Mantém a tarefa no
+  // array local em memória mesmo depois de arquivada (só as próximas cargas
+  // do servidor já filtram archived_at — ver taskRepo.selectNormalTasks) pra
+  // não fechar o modal de detalhe sozinho logo depois de arquivar.
+  const handleArchiveTask = (task: Task) => {
+    const isDoneLike = isDoneLikeStatus(task.status);
+    const doArchive = async () => {
+      const res = await taskRepo.archiveTask(task.id, currentUser.id);
+      if (!res.ok) { toast.error('Erro ao arquivar tarefa: ' + res.message); return; }
+      const archivedAt = new Date().toISOString();
+      setTasks(prev => prev.map(t => t.id === task.id ? { ...t, archivedAt, archivedBy: currentUser.id } : t));
+      await taskRepo.insertActivity(task.id, currentUser.id, 'TASK_ARCHIVED');
+      toast.success('Tarefa arquivada.');
+    };
+    if (isDoneLike) {
+      doArchive();
+    } else {
+      setConfirmModal({
+        message: 'Esta tarefa ainda não está concluída. Arquivá-la irá removê-la das visualizações normais, mas seu status continuará o mesmo.',
+        confirmLabel: 'Arquivar mesmo assim',
+        variant: 'warning',
+        onConfirm: doArchive,
+      });
+    }
+  };
+
+  const handleUnarchiveTask = async (task: Task) => {
+    const res = await taskRepo.unarchiveTask(task.id);
+    if (!res.ok) { toast.error('Erro ao desarquivar tarefa: ' + res.message); return; }
+    setTasks(prev => prev.map(t => t.id === task.id ? { ...t, archivedAt: undefined, archivedBy: undefined } : t));
+    await taskRepo.insertActivity(task.id, currentUser.id, 'TASK_UNARCHIVED');
+    toast.success('Tarefa desarquivada.');
   };
 
   const handleDeleteSpace = (spaceId: string) => {
@@ -4369,6 +4404,8 @@ export default function App() {
               }}
               onDelete={() => handleDeleteTask(selectedTask.id)}
               onDuplicate={() => setTaskToDuplicate(selectedTask)}
+              onArchive={() => handleArchiveTask(selectedTask)}
+              onUnarchive={() => handleUnarchiveTask(selectedTask)}
               onConfigureRecurrence={() => openTaskRecurrenceModal(selectedTask)}
               recurrenceRule={taskRecurrenceRuleCache[selectedTask.id]}
               onSelectTask={setSelectedTaskId}
@@ -4554,6 +4591,8 @@ export default function App() {
         {confirmModal && (
           <ConfirmModal
             message={confirmModal.message}
+            confirmLabel={confirmModal.confirmLabel}
+            variant={confirmModal.variant}
             onConfirm={() => { confirmModal.onConfirm(); setConfirmModal(null); }}
             onClose={() => setConfirmModal(null)}
           />
@@ -6415,13 +6454,30 @@ function RenameModal({ title, defaultValue, placeholder, onConfirm, onClose }: {
   );
 }
 
-function ConfirmModal({ message, onConfirm, onClose }: { message: string; onConfirm: () => void; onClose: () => void }) {
+function ConfirmModal({
+  message,
+  confirmLabel = 'Excluir',
+  variant = 'danger',
+  onConfirm,
+  onClose,
+}: {
+  message: string;
+  confirmLabel?: string;
+  variant?: 'danger' | 'warning';
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  // 'danger' (padrão) preserva o visual vermelho já usado pelas exclusões
+  // existentes; 'warning' (âmbar) é pra ações reversíveis com aviso reforçado
+  // (ex.: arquivar tarefa não concluída — issue #185 seção 5), pra não
+  // assustar o usuário com a mesma cor de "isso vai apagar algo".
+  const isDanger = variant === 'danger';
   return (
     <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 p-6 flex flex-col gap-5" onClick={e => e.stopPropagation()}>
         <div className="flex items-start gap-3">
-          <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center shrink-0">
-            <svg className="w-5 h-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+          <div className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${isDanger ? 'bg-red-100' : 'bg-amber-100'}`}>
+            <svg className={`w-5 h-5 ${isDanger ? 'text-red-600' : 'text-amber-600'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
           </div>
           <div>
             <p className="font-semibold text-gray-800 text-sm">Confirmar ação</p>
@@ -6430,7 +6486,12 @@ function ConfirmModal({ message, onConfirm, onClose }: { message: string; onConf
         </div>
         <div className="flex gap-2 justify-end">
           <button onClick={onClose} className="px-4 py-2 text-sm rounded-lg border text-gray-600 hover:bg-gray-50">Cancelar</button>
-          <button onClick={onConfirm} className="px-4 py-2 text-sm rounded-lg bg-red-600 text-white font-bold hover:bg-red-700">Excluir</button>
+          <button
+            onClick={onConfirm}
+            className={`px-4 py-2 text-sm rounded-lg text-white font-bold ${isDanger ? 'bg-red-600 hover:bg-red-700' : 'bg-amber-500 hover:bg-amber-600'}`}
+          >
+            {confirmLabel}
+          </button>
         </div>
       </div>
     </div>
@@ -9698,6 +9759,8 @@ function TaskDetailModal(props: any) {
     hiddenTaskFieldIdsByList,
     onDelete,
     onDuplicate,
+    onArchive,
+    onUnarchive,
     onConfigureRecurrence,
     recurrenceRule,
     tasks,
@@ -10285,6 +10348,15 @@ function TaskDetailModal(props: any) {
                 </button>
               )
             )}
+            {!isReadOnly && (task.archivedAt ? onUnarchive : onArchive) && (
+              <button
+                onClick={task.archivedAt ? onUnarchive : onArchive}
+                className="flex items-center gap-2 px-3 py-1.5 hover:bg-amber-50 text-gray-500 hover:text-amber-600 text-sm font-medium rounded-lg transition-all"
+                title={task.archivedAt ? 'Desarquivar tarefa' : 'Arquivar tarefa'}
+              >
+                <ArchiveIcon className="w-4 h-4" /> {task.archivedAt ? 'Desarquivar' : 'Arquivar'}
+              </button>
+            )}
             {!isReadOnly && onDelete && (
               <button onClick={onDelete} className="p-2 hover:bg-red-50 text-red-400 rounded-lg transition-colors" title="Excluir Tarefa">
                 <Icons.Trash />
@@ -10306,6 +10378,14 @@ function TaskDetailModal(props: any) {
                   <Icons.Check className="w-3 h-3" /> Tarefa
                 </div>
                 <span className="text-gray-300 text-sm font-medium">{task.id.slice(0, 8)}</span>
+                {task.archivedAt && (
+                  <span
+                    className="flex items-center gap-1.5 px-2 py-1 bg-amber-50 text-amber-700 rounded text-[10px] font-bold uppercase"
+                    title={`Arquivada em ${formatDate(task.archivedAt)}${task.archivedBy ? ' por ' + (users.find((u: any) => u.id === task.archivedBy)?.name || 'alguém') : ''}`}
+                  >
+                    <ArchiveIcon className="w-3 h-3" /> Arquivada
+                  </span>
+                )}
                 <button
                   onClick={() => setShowAIPanel(v => !v)}
                   className={`flex items-center gap-1.5 px-3 py-1 font-bold text-xs rounded transition-colors ml-2 ${showAIPanel ? 'bg-purple-100 text-purple-700' : 'text-purple-600 hover:bg-purple-50'}`}
@@ -10960,7 +11040,9 @@ function TaskDetailModal(props: any) {
                       'RESPONSIBLE_REMOVED': 'bg-red-50/30 border-red-50 text-red-600 circle-red-400',
                       'TEAM_ASSIGNED': 'bg-purple-50/30 border-purple-50 text-purple-600 circle-purple-400',
                       'TASK_DUPLICATED': 'bg-indigo-50/30 border-indigo-50 text-indigo-600 circle-indigo-400',
-                      'TASK_RECURRENCE_GENERATED': 'bg-indigo-50/30 border-indigo-50 text-indigo-600 circle-indigo-400'
+                      'TASK_RECURRENCE_GENERATED': 'bg-indigo-50/30 border-indigo-50 text-indigo-600 circle-indigo-400',
+                      'TASK_ARCHIVED': 'bg-amber-50/30 border-amber-50 text-amber-600 circle-amber-400',
+                      'TASK_UNARCHIVED': 'bg-amber-50/30 border-amber-50 text-amber-600 circle-amber-400'
                     };
 
                     const style = typeStyles[item.type] || 'bg-gray-50/30 border-gray-50 text-gray-600 circle-gray-400';
@@ -10981,6 +11063,8 @@ function TaskDetailModal(props: any) {
                             {item.type === 'TASK_RECURRENCE_GENERATED' && (
                               <>tarefa gerada automaticamente pela recorrência de <span className={`font-bold ${textAccentClass}`}>{item.newValue}</span></>
                             )}
+                            {item.type === 'TASK_ARCHIVED' && <>arquivou esta tarefa</>}
+                            {item.type === 'TASK_UNARCHIVED' && <>desarquivou esta tarefa</>}
                             {item.type === 'STATUS_CHANGE' && (
                               <>alterou o status para <span className={`font-bold ${textAccentClass}`}>{item.newValue}</span></>
                             )}
