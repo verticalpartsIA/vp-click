@@ -1,11 +1,14 @@
 name: Deploy VPS — vpclick.vpsistema.com
 
-# Disparo manual só (workflow_dispatch) por enquanto: esse pipeline ainda é
-# novo (migrado da hospedagem compartilhada Hostinger em 2026-09-06) e
-# convém confirmar alguns deploys manuais antes de deixar automático em
-# todo push. Depois de validado, trocar pra `on: push: branches: [main]`
-# como o deploy.yml antigo (hospedagem compartilhada).
+# Automático a cada push em main — validado manualmente em 2026-09-06/07
+# (migração da hospedagem compartilhada Hostinger pra VPS Docker). Antes
+# disso só disparava via workflow_dispatch, o que deixou 3 deploys de
+# produção (gotas 3/4/5 da issue #185) sem chegar no site: o deploy.yml
+# antigo (Hostinger) continuava rodando sozinho a cada push e passando
+# verde, mas vpclick.vpsistema.com não é mais servido por lá.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
