@@ -899,6 +899,15 @@ export async function deleteTask(taskId: string): Promise<{ ok: true } | { ok: f
   return deleteTaskTree(taskId);
 }
 
+// Issue #185, gota 5 — "Excluir permanentemente". Reaproveita a mesma
+// recursão de deleteTaskTree (bottom-up, já lida com a FK NO ACTION de
+// parent_id). A RLS de DELETE (tasks_del) agora exige is_admin() E
+// deleted_at IS NOT NULL — só funciona numa tarefa que já passou pelo soft
+// delete (gota 4); chamar isto direto numa tarefa normal falha por RLS.
+export async function permanentlyDeleteTask(taskId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  return deleteTaskTree(taskId);
+}
+
 // ── Escrita de sub-entidades ────────────────────────────────────────────────
 // Padrão de retorno `{ <dado>?, error }` espelhando o próprio Supabase: o App
 // checa `error` e cuida do estado otimista/toasts. `error` é uma mensagem em

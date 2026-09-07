@@ -1906,6 +1906,10 @@ export default function App() {
   // Lixeira. Guarda só o id da tarefa (não o objeto) pra não prender uma
   // referência potencialmente desatualizada enquanto o modal fica aberto.
   const [trashReasonModal, setTrashReasonModal] = useState<{ taskId: string } | null>(null);
+  // Issue #185, gota 5 — "Excluir permanentemente" (seção 24): confirmação
+  // forte, exige digitar "EXCLUIR". Guarda o objeto (não só o id) porque o
+  // modal precisa mostrar o título da tarefa.
+  const [permanentDeleteConfirm, setPermanentDeleteConfirm] = useState<{ task: Task } | null>(null);
 
   // Issue #185, gotas 3/4: uma tarefa aberta a partir do painel "Tarefas
   // arquivadas" ou da "Lixeira" não está em `tasks` (loadTasks já filtra
@@ -2418,6 +2422,28 @@ export default function App() {
     setTrashedTasks(prev => prev.filter(t => t.id !== task.id));
     await taskRepo.insertActivity(task.id, currentUser.id, 'TASK_RESTORED');
     toast.success('Tarefa restaurada.');
+  };
+
+  // Issue #185, gota 5 — "Excluir permanentemente" (seção 24): abre a
+  // confirmação forte (TrashReasonModal exige digitar "EXCLUIR"). RLS
+  // (tasks_del) já garante ADMIN + deleted_at IS NOT NULL no servidor — o
+  // gate de UI (botão só aparece pra ADMIN) é só UX, não a única barreira.
+  const handlePermanentlyDeleteTask = (task: Task) => {
+    setPermanentDeleteConfirm({ task });
+  };
+
+  const handleConfirmPermanentDelete = async () => {
+    const task = permanentDeleteConfirm?.task;
+    if (!task) return;
+    setPermanentDeleteConfirm(null);
+    const res = await taskRepo.permanentlyDeleteTask(task.id);
+    if (!res.ok) { toast.error('Erro ao excluir permanentemente: ' + res.message); return; }
+    setTrashedTasks(prev => prev.filter(t => t.id !== task.id));
+    setTasks(prev => prev.filter(t => t.id !== task.id));
+    setArchivedTasks(prev => prev.filter(t => t.id !== task.id));
+    setMyTasks(prev => prev.filter(t => t.id !== task.id));
+    if (selectedTaskId === task.id) setSelectedTaskId(null);
+    toast.success('Tarefa excluída permanentemente.');
   };
 
   // Carrega sob demanda (só quando o painel "Lixeira" abre), mesmo escopo que
@@ -4536,6 +4562,7 @@ export default function App() {
               onArchive={() => handleArchiveTask(selectedTask)}
               onUnarchive={() => handleUnarchiveTask(selectedTask)}
               onRestore={() => handleRestoreTask(selectedTask)}
+              onPermanentlyDelete={() => handlePermanentlyDeleteTask(selectedTask)}
               onConfigureRecurrence={() => openTaskRecurrenceModal(selectedTask)}
               recurrenceRule={taskRecurrenceRuleCache[selectedTask.id]}
               onSelectTask={setSelectedTaskId}
@@ -4748,9 +4775,11 @@ export default function App() {
             tasks={trashedTasks}
             lists={lists}
             users={adminUsers}
+            isAdmin={currentUser.role === UserRole.ADMIN}
             onClose={() => setIsTrashPanelOpen(false)}
             onOpenTask={(taskId) => { setSelectedTaskId(taskId); setIsTrashPanelOpen(false); }}
             onRestore={handleRestoreTask}
+            onPermanentlyDelete={handlePermanentlyDeleteTask}
           />
         )}
 
@@ -4759,6 +4788,15 @@ export default function App() {
           <TrashReasonModal
             onClose={() => setTrashReasonModal(null)}
             onConfirm={handleConfirmMoveToTrash}
+          />
+        )}
+
+        {/* Issue #185, gota 5 — confirmação forte de "Excluir permanentemente" */}
+        {permanentDeleteConfirm && (
+          <PermanentDeleteConfirmModal
+            taskTitle={permanentDeleteConfirm.task.title}
+            onClose={() => setPermanentDeleteConfirm(null)}
+            onConfirm={handleConfirmPermanentDelete}
           />
         )}
       </div>
@@ -6748,24 +6786,29 @@ function ArchivedTasksModal({
 
 // Issue #185, gota 4 ("Lixeira") — mesmo padrão do ArchivedTasksModal (gota
 // 3): painel simples e separado do ListView, só achar/restaurar. Mostra a
-// contagem regressiva até o purge (seção 12 da issue) — o purge automático em
-// si (pg_cron/Edge Function) é uma gota futura; aqui só a exibição.
+// contagem regressiva até o purge (seção 12 da issue) — o purge em si (pg_cron,
+// gota 5) roda no servidor; aqui só a exibição. "Excluir permanentemente"
+// (gota 5) só aparece pra ADMIN — a barreira de verdade é a RLS (tasks_del).
 function TrashModal({
   isLoading,
   tasks,
   lists,
   users,
+  isAdmin,
   onClose,
   onOpenTask,
   onRestore,
+  onPermanentlyDelete,
 }: {
   isLoading: boolean;
   tasks: Task[];
   lists: List[];
   users: any[];
+  isAdmin: boolean;
   onClose: () => void;
   onOpenTask: (taskId: string) => void;
   onRestore: (task: Task) => void;
+  onPermanentlyDelete: (task: Task) => void;
 }) {
   const daysUntil = (iso?: string) => {
     if (!iso) return null;
@@ -6835,6 +6878,15 @@ function TrashModal({
                       >
                         Restaurar
                       </button>
+                      {isAdmin && (
+                        <button
+                          onClick={() => onPermanentlyDelete(task)}
+                          className="px-2.5 py-1 text-xs rounded-md border border-red-200 text-red-600 hover:bg-red-50 font-medium"
+                          title="Excluir permanentemente"
+                        >
+                          Excluir agora
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -6911,6 +6963,61 @@ function TrashReasonModal({
             className="px-4 py-2 text-sm rounded-lg text-white font-bold bg-red-600 hover:bg-red-700"
           >
             Mover para Lixeira
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Issue #185, gota 5, seção 24 — confirmação forte pra "Excluir
+// permanentemente": exige digitar EXCLUIR pra habilitar o botão. Ação
+// irreversível, só chega aqui quem já vê o botão (ADMIN) — RLS é a barreira
+// de verdade, isto é só fricção deliberada de UX.
+function PermanentDeleteConfirmModal({
+  taskTitle,
+  onClose,
+  onConfirm,
+}: {
+  taskTitle: string;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const [confirmText, setConfirmText] = useState('');
+  const canConfirm = confirmText.trim().toUpperCase() === 'EXCLUIR';
+  return (
+    <div className="fixed inset-0 z-[210] flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 p-6 flex flex-col gap-4" onClick={e => e.stopPropagation()}>
+        <div className="flex items-start gap-3">
+          <div className="w-10 h-10 rounded-full flex items-center justify-center shrink-0 bg-red-100">
+            <Icons.Trash className="w-5 h-5 text-red-600" />
+          </div>
+          <div>
+            <p className="font-semibold text-gray-800 text-sm">Excluir permanentemente?</p>
+            <p className="text-sm text-gray-500 mt-1">
+              Esta ação não poderá ser desfeita. "{taskTitle}" e todos os dados associados que não forem compartilhados serão removidos.
+            </p>
+          </div>
+        </div>
+        <div>
+          <label className="text-xs font-semibold text-gray-500 mb-1.5 block">Digite EXCLUIR para confirmar</label>
+          <input
+            type="text"
+            value={confirmText}
+            onChange={(e) => setConfirmText(e.target.value)}
+            placeholder="EXCLUIR"
+            autoFocus
+            className="w-full text-sm border rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-red-200"
+          />
+        </div>
+        <div className="flex gap-2 justify-end">
+          <button onClick={onClose} className="px-4 py-2 text-sm rounded-lg border text-gray-600 hover:bg-gray-50">Cancelar</button>
+          <button
+            onClick={onConfirm}
+            disabled={!canConfirm}
+            className="px-4 py-2 text-sm rounded-lg text-white font-bold bg-red-600 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Excluir permanentemente
           </button>
         </div>
       </div>
@@ -10182,6 +10289,7 @@ function TaskDetailModal(props: any) {
     onArchive,
     onUnarchive,
     onRestore,
+    onPermanentlyDelete,
     onConfigureRecurrence,
     recurrenceRule,
     tasks,
@@ -10779,6 +10887,17 @@ function TaskDetailModal(props: any) {
                 title="Restaurar tarefa"
               >
                 <RotateCcw className="w-4 h-4" /> Restaurar
+              </button>
+            )}
+            {/* Issue #185, gota 5: "Excluir permanentemente" só pra ADMIN —
+                a RLS (tasks_del) é a barreira de verdade, isto é só UX. */}
+            {!isReadOnly && task.deletedAt && currentUser.role === UserRole.ADMIN && onPermanentlyDelete && (
+              <button
+                onClick={() => onPermanentlyDelete(task)}
+                className="flex items-center gap-2 px-3 py-1.5 hover:bg-red-50 text-red-500 text-sm font-medium rounded-lg transition-all"
+                title="Excluir permanentemente"
+              >
+                <Icons.Trash className="w-4 h-4" /> Excluir permanentemente
               </button>
             )}
             {!isReadOnly && !task.deletedAt && (task.archivedAt ? onUnarchive : onArchive) && (
