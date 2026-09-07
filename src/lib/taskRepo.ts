@@ -335,6 +335,22 @@ export function fetchArchivedTasksByListIds(listIds: string[] | null): Promise<T
   );
 }
 
+// Issue #185, gota 4 ("Lixeira"): mesmo escopo por listIds das consultas
+// acima, só que deleted_at NÃO nulo (independente de archived_at — uma tarefa
+// podia estar arquivada antes de ir pra lixeira, seção 13 da issue).
+export function fetchTrashedTasksByListIds(listIds: string[] | null): Promise<TaskRow[]> {
+  return fetchAllPages<TaskRow>(
+    (from, to) => {
+      const q = supabase.from('tasks').select(TASK_ROW_SELECT).not('deleted_at', 'is', null);
+      return (listIds ? q.in('list_id', listIds) : q)
+        .order('deleted_at', { ascending: false })
+        .order('id', { ascending: true })
+        .range(from, to);
+    },
+    'fetchTrashedTasksByListIds',
+  );
+}
+
 export function fetchRemainingTaskRowsByListIds(listIds: string[] | null): Promise<TaskRow[]> {
   return fetchAllPages<TaskRow>(
     (from, to) => {
@@ -755,6 +771,95 @@ export async function unarchiveTask(taskId: string): Promise<{ ok: true } | { ok
     .update({ archived_at: null, archived_by: null })
     .eq('id', taskId);
   if (error) return { ok: false, message: error.message };
+  return { ok: true };
+}
+
+const TRASH_RETENTION_DAYS = 30;
+
+// Issue #185, gota 4 — soft delete real (substitui o hard-delete direto que
+// handleDeleteTask usava). Move a tarefa (e a árvore de subtarefas, mesma
+// lógica de baixo-pra-cima de deleteTaskTree — aqui a ordem não importa por
+// não esbarrar em FK, mas mantém a mesma forma pra reaproveitar a detecção de
+// ciclo) pra "Lixeira": preenche deleted_at/deleted_by/purge_after (+30 dias,
+// seção 8/11 da issue) e o motivo (seção 10). NUNCA mexe em status/archived_at
+// — uma tarefa que já estava arquivada continua arquivada ao ser restaurada
+// (seção 13).
+export async function softDeleteTaskTree(
+  taskId: string,
+  userId: string,
+  reasonCode: string | null,
+  reasonText: string | null,
+  visited = new Set<string>(),
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (visited.has(taskId)) {
+    return { ok: false, message: 'Foi detectado um ciclo inválido entre tarefa e subtarefa.' };
+  }
+  visited.add(taskId);
+
+  const { data: children, error: childrenError } = await supabase
+    .from('tasks')
+    .select('id')
+    .eq('parent_id', taskId);
+  if (childrenError) return { ok: false, message: childrenError.message };
+
+  for (const child of children || []) {
+    const result = await softDeleteTaskTree(child.id, userId, reasonCode, reasonText, visited);
+    if (!result.ok) return result;
+  }
+
+  const deletedAt = new Date();
+  const purgeAfter = new Date(deletedAt.getTime() + TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  const { data, error } = await supabase
+    .from('tasks')
+    .update({
+      deleted_at: deletedAt.toISOString(),
+      deleted_by: userId,
+      purge_after: purgeAfter.toISOString(),
+      deletion_reason_code: reasonCode,
+      deletion_reason_text: reasonText,
+    })
+    .eq('id', taskId)
+    .select('id');
+  if (error) return { ok: false, message: error.message };
+  if (!data?.length) {
+    return { ok: false, message: 'A tarefa não foi encontrada ou você não possui permissão para excluí-la.' };
+  }
+  return { ok: true };
+}
+
+// Restaura a árvore inteira (seção 16 da issue: restaurar o pai recompõe as
+// subtarefas também) — limpa deleted_at/deleted_by/purge_after/motivo em
+// cascata. Idempotente: limpar campos já nulos numa subtarefa que não estava
+// na lixeira não tem efeito.
+export async function restoreTaskTree(
+  taskId: string,
+  visited = new Set<string>(),
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (visited.has(taskId)) {
+    return { ok: false, message: 'Foi detectado um ciclo inválido entre tarefa e subtarefa.' };
+  }
+  visited.add(taskId);
+
+  const { data: children, error: childrenError } = await supabase
+    .from('tasks')
+    .select('id')
+    .eq('parent_id', taskId);
+  if (childrenError) return { ok: false, message: childrenError.message };
+
+  for (const child of children || []) {
+    const result = await restoreTaskTree(child.id, visited);
+    if (!result.ok) return result;
+  }
+
+  const { data, error } = await supabase
+    .from('tasks')
+    .update({ deleted_at: null, deleted_by: null, purge_after: null, deletion_reason_code: null, deletion_reason_text: null })
+    .eq('id', taskId)
+    .select('id');
+  if (error) return { ok: false, message: error.message };
+  if (!data?.length) {
+    return { ok: false, message: 'A tarefa não foi encontrada ou você não possui permissão para restaurá-la.' };
+  }
   return { ok: true };
 }
 

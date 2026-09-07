@@ -1897,13 +1897,25 @@ export default function App() {
   const [isArchivedPanelOpen, setIsArchivedPanelOpen] = useState(false);
   const [isArchivedLoading, setIsArchivedLoading] = useState(false);
 
-  // Issue #185, gota 3: uma tarefa aberta a partir do painel "Tarefas
-  // arquivadas" não está em `tasks` (loadTasks já filtra archived_at) — sem
-  // este fallback, o efeito de "tarefa não existe mais" logo abaixo a fecharia
-  // na hora.
+  // Issue #185, gota 4 ("Lixeira"): mesmo raciocínio da gota 3 — fora de
+  // `tasks` de propósito, carregada sob demanda ao abrir o painel.
+  const [trashedTasks, setTrashedTasks] = useState<Task[]>([]);
+  const [isTrashPanelOpen, setIsTrashPanelOpen] = useState(false);
+  const [isTrashLoading, setIsTrashLoading] = useState(false);
+  // Motivo da exclusão (seção 10 da issue) — perguntado antes de mover pra
+  // Lixeira. Guarda só o id da tarefa (não o objeto) pra não prender uma
+  // referência potencialmente desatualizada enquanto o modal fica aberto.
+  const [trashReasonModal, setTrashReasonModal] = useState<{ taskId: string } | null>(null);
+
+  // Issue #185, gotas 3/4: uma tarefa aberta a partir do painel "Tarefas
+  // arquivadas" ou da "Lixeira" não está em `tasks` (loadTasks já filtra
+  // archived_at/deleted_at) — sem este fallback, o efeito de "tarefa não
+  // existe mais" logo abaixo a fecharia na hora.
   const selectedTask = useMemo(
-    () => tasks.find(t => t.id === selectedTaskId) ?? archivedTasks.find(t => t.id === selectedTaskId),
-    [tasks, archivedTasks, selectedTaskId],
+    () => tasks.find(t => t.id === selectedTaskId)
+      ?? archivedTasks.find(t => t.id === selectedTaskId)
+      ?? trashedTasks.find(t => t.id === selectedTaskId),
+    [tasks, archivedTasks, trashedTasks, selectedTaskId],
   );
 
   // Carrega a regra de recorrência da tarefa aberta (se houver) só pro
@@ -1941,12 +1953,13 @@ export default function App() {
       && isTasksFullyLoaded
       && !tasks.some(t => t.id === selectedTaskId)
       && !archivedTasks.some(t => t.id === selectedTaskId)
+      && !trashedTasks.some(t => t.id === selectedTaskId)
     ) {
       toast.error('Essa tarefa não existe mais ou você não tem acesso a ela.');
       setSelectedTaskId(null);
       setTaskCommentFocus(null);
     }
-  }, [selectedTaskId, tasks, archivedTasks, isTasksFullyLoaded]);
+  }, [selectedTaskId, tasks, archivedTasks, trashedTasks, isTasksFullyLoaded]);
 
   // Resolve .../tarefa/<slug>-<8chars> (ver pendingTaskSlugId) assim que
   // `tasks` do escopo carregar por completo: acha a tarefa cujo id começa
@@ -2359,20 +2372,68 @@ export default function App() {
   };
 
   // --- Deletion and Renaming Logic ---
+  // Issue #185, gota 4 — soft delete real (seção 8/9 da issue): "Excluir" não
+  // apaga mais na hora, abre o seletor de motivo (TrashReasonModal) e move
+  // pra Lixeira. handleConfirmMoveToTrash faz o soft delete de verdade.
   const handleDeleteTask = (taskId: string) => {
-    setConfirmModal({
-      message: 'Excluir esta tarefa permanentemente?',
-      onConfirm: async () => {
-        const res = await taskRepo.deleteTask(taskId);
-        if (res.ok) {
-          setTasks(prev => prev.filter(t => t.id !== taskId));
-          setMyTasks(prev => prev.filter(t => t.id !== taskId));
-          if (selectedTaskId === taskId) setSelectedTaskId(null);
-          toast.success('Tarefa excluída.');
-        } else { toast.error('Erro ao excluir tarefa: ' + res.message); }
-      }
-    });
+    setTrashReasonModal({ taskId });
   };
+
+  const handleConfirmMoveToTrash = async (reasonCode: string | null, reasonText: string | null) => {
+    const taskId = trashReasonModal?.taskId;
+    if (!taskId) return;
+    setTrashReasonModal(null);
+    const res = await taskRepo.softDeleteTaskTree(taskId, currentUser.id, reasonCode, reasonText);
+    if (!res.ok) { toast.error('Erro ao mover tarefa para a Lixeira: ' + res.message); return; }
+    // Só o nível de topo — o mesmo critério que o hard-delete anterior já
+    // usava aqui (subtarefas somem do array local no próximo loadTasks/
+    // realtime, não há remoção em cascata client-side).
+    setTasks(prev => prev.filter(t => t.id !== taskId));
+    setMyTasks(prev => prev.filter(t => t.id !== taskId));
+    setArchivedTasks(prev => prev.filter(t => t.id !== taskId));
+    if (selectedTaskId === taskId) setSelectedTaskId(null);
+    await taskRepo.insertActivity(taskId, currentUser.id, 'TASK_MOVED_TO_TRASH', undefined, reasonCode ?? undefined);
+    toast.success('Tarefa movida para a Lixeira.');
+  };
+
+  // Restaura (seção 13): a tarefa volta pro balde certo — `archivedTasks` se
+  // já estava arquivada antes de ser excluída (softDeleteTaskTree nunca mexeu
+  // em archived_at), `tasks` caso contrário.
+  const handleRestoreTask = async (task: Task) => {
+    const res = await taskRepo.restoreTaskTree(task.id);
+    if (!res.ok) { toast.error('Erro ao restaurar tarefa: ' + res.message); return; }
+    const restored: Task = {
+      ...task,
+      deletedAt: undefined,
+      deletedBy: undefined,
+      purgeAfter: undefined,
+      deletionReasonCode: undefined,
+      deletionReasonText: undefined,
+    };
+    if (restored.archivedAt) {
+      setArchivedTasks(prev => prev.some(t => t.id === task.id) ? prev.map(t => t.id === task.id ? restored : t) : [restored, ...prev]);
+    } else {
+      setTasks(prev => prev.some(t => t.id === task.id) ? prev.map(t => t.id === task.id ? restored : t) : [...prev, restored]);
+    }
+    setTrashedTasks(prev => prev.filter(t => t.id !== task.id));
+    await taskRepo.insertActivity(task.id, currentUser.id, 'TASK_RESTORED');
+    toast.success('Tarefa restaurada.');
+  };
+
+  // Carrega sob demanda (só quando o painel "Lixeira" abre), mesmo escopo que
+  // loadArchivedTasks/loadTasks usam.
+  const loadTrashedTasks = useCallback(async () => {
+    setIsTrashLoading(true);
+    try {
+      const rows = await taskRepo.fetchTrashedTasksByListIds(activeListId ? [activeListId] : scopedListIds);
+      setTrashedTasks(rows.map(taskRepo.mapRowToTaskShell));
+    } catch (err) {
+      console.error('Erro ao carregar a Lixeira:', err);
+      toast.error('Não foi possível carregar a Lixeira.');
+    } finally {
+      setIsTrashLoading(false);
+    }
+  }, [activeListId, scopedListIds]);
 
   // Issue #185, gota 2 — arquivar/desarquivar. Dimensão independente do
   // status (seção 1 da issue): NUNCA muda `status` aqui. Mantém a tarefa no
@@ -4130,6 +4191,15 @@ export default function App() {
                     <ArchiveIcon className="w-3.5 h-3.5" /> Arquivadas
                   </button>
                 )}
+                {activeScope.type !== 'global' && (
+                  <button
+                    onClick={() => { setIsTrashPanelOpen(true); loadTrashedTasks(); }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border border-gray-200 bg-white hover:bg-red-50 text-gray-600 hover:text-red-600 transition-colors font-medium whitespace-nowrap"
+                    title="Ver a Lixeira deste escopo"
+                  >
+                    <Icons.Trash className="w-3.5 h-3.5" /> Lixeira
+                  </button>
+                )}
                 <div className="flex-1" />
                 <button
                   onClick={() => setIsTaskModalOpen(true)}
@@ -4465,6 +4535,7 @@ export default function App() {
               onDuplicate={() => setTaskToDuplicate(selectedTask)}
               onArchive={() => handleArchiveTask(selectedTask)}
               onUnarchive={() => handleUnarchiveTask(selectedTask)}
+              onRestore={() => handleRestoreTask(selectedTask)}
               onConfigureRecurrence={() => openTaskRecurrenceModal(selectedTask)}
               recurrenceRule={taskRecurrenceRuleCache[selectedTask.id]}
               onSelectTask={setSelectedTaskId}
@@ -4667,6 +4738,27 @@ export default function App() {
             onClose={() => setIsArchivedPanelOpen(false)}
             onOpenTask={(taskId) => { setSelectedTaskId(taskId); setIsArchivedPanelOpen(false); }}
             onUnarchive={handleUnarchiveTask}
+          />
+        )}
+
+        {/* Issue #185, gota 4 — painel "Lixeira" */}
+        {isTrashPanelOpen && (
+          <TrashModal
+            isLoading={isTrashLoading}
+            tasks={trashedTasks}
+            lists={lists}
+            users={adminUsers}
+            onClose={() => setIsTrashPanelOpen(false)}
+            onOpenTask={(taskId) => { setSelectedTaskId(taskId); setIsTrashPanelOpen(false); }}
+            onRestore={handleRestoreTask}
+          />
+        )}
+
+        {/* Issue #185, gota 4 — seletor de motivo antes de mover pra Lixeira */}
+        {trashReasonModal && (
+          <TrashReasonModal
+            onClose={() => setTrashReasonModal(null)}
+            onConfirm={handleConfirmMoveToTrash}
           />
         )}
       </div>
@@ -6648,6 +6740,178 @@ function ArchivedTasksModal({
               })}
             </div>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Issue #185, gota 4 ("Lixeira") — mesmo padrão do ArchivedTasksModal (gota
+// 3): painel simples e separado do ListView, só achar/restaurar. Mostra a
+// contagem regressiva até o purge (seção 12 da issue) — o purge automático em
+// si (pg_cron/Edge Function) é uma gota futura; aqui só a exibição.
+function TrashModal({
+  isLoading,
+  tasks,
+  lists,
+  users,
+  onClose,
+  onOpenTask,
+  onRestore,
+}: {
+  isLoading: boolean;
+  tasks: Task[];
+  lists: List[];
+  users: any[];
+  onClose: () => void;
+  onOpenTask: (taskId: string) => void;
+  onRestore: (task: Task) => void;
+}) {
+  const daysUntil = (iso?: string) => {
+    if (!iso) return null;
+    const diffMs = new Date(iso).getTime() - Date.now();
+    return Math.ceil(diffMs / (24 * 60 * 60 * 1000));
+  };
+  return (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-6 py-4 border-b">
+          <div>
+            <div className="flex items-center gap-2">
+              <Icons.Trash className="w-4 h-4 text-red-500" />
+              <p className="font-semibold text-gray-800 text-sm">Lixeira</p>
+            </div>
+            <p className="text-xs text-gray-500 mt-0.5">Itens excluídos ficam disponíveis para restauração por 30 dias. Depois disso, são excluídos permanentemente.</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 shrink-0">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-auto custom-scrollbar p-4">
+          {isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <div className="w-6 h-6 border-2 border-gray-200 border-t-red-400 rounded-full animate-spin" />
+            </div>
+          ) : tasks.length === 0 ? (
+            <p className="text-sm text-gray-500 text-center py-12">A Lixeira deste escopo está vazia.</p>
+          ) : (
+            <div className="flex flex-col gap-1">
+              {tasks.map(task => {
+                const list = lists.find(l => l.id === task.listId);
+                const deletedByName = users.find((u: any) => u.id === task.deletedBy)?.name;
+                const remaining = daysUntil(task.purgeAfter);
+                const reasonLabel = DELETION_REASONS.find(r => r.code === task.deletionReasonCode)?.label;
+                return (
+                  <div
+                    key={task.id}
+                    className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg border border-transparent hover:bg-red-50/50 hover:border-red-100 transition-colors"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-gray-800 truncate">{task.title}</p>
+                      <p className="text-xs text-gray-500 truncate">
+                        {list?.name ? `${list.name} · ` : ''}
+                        Excluída {task.deletedAt ? new Date(task.deletedAt).toLocaleDateString('pt-BR') : ''}
+                        {deletedByName ? ` por ${deletedByName}` : ''}
+                        {reasonLabel ? ` · ${reasonLabel}` : ''}
+                        {task.deletionReasonText ? ` — "${task.deletionReasonText}"` : ''}
+                      </p>
+                      {remaining !== null && (
+                        <p className={`text-[11px] font-semibold mt-0.5 ${remaining <= 5 ? 'text-red-600' : 'text-gray-400'}`}>
+                          {remaining <= 5 ? '⚠ ' : ''}
+                          {remaining > 0 ? `Exclusão permanente em ${remaining} dia${remaining === 1 ? '' : 's'}` : 'Exclusão permanente em breve'}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => onOpenTask(task.id)}
+                        className="px-2.5 py-1 text-xs rounded-md border text-gray-600 hover:bg-gray-50"
+                      >
+                        Abrir
+                      </button>
+                      <button
+                        onClick={() => onRestore(task)}
+                        className="px-2.5 py-1 text-xs rounded-md bg-emerald-500 hover:bg-emerald-600 text-white font-medium"
+                      >
+                        Restaurar
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Issue #185 seção 10 — motivo opcional antes de mover pra Lixeira.
+const DELETION_REASONS: { code: string; label: string }[] = [
+  { code: 'CRIADA_ENGANO', label: 'Criada por engano' },
+  { code: 'DUPLICADA', label: 'Duplicada' },
+  { code: 'NAO_NECESSARIA', label: 'Não será mais necessária' },
+  { code: 'INFO_INCORRETA', label: 'Informação incorreta' },
+  { code: 'SOLICITACAO_CANCELADA', label: 'Solicitação cancelada' },
+  { code: 'OUTRO', label: 'Outro' },
+];
+
+function TrashReasonModal({
+  onClose,
+  onConfirm,
+}: {
+  onClose: () => void;
+  onConfirm: (reasonCode: string | null, reasonText: string | null) => void;
+}) {
+  const [reasonCode, setReasonCode] = useState<string | null>(null);
+  const [reasonText, setReasonText] = useState('');
+  return (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 p-6 flex flex-col gap-4" onClick={e => e.stopPropagation()}>
+        <div className="flex items-start gap-3">
+          <div className="w-10 h-10 rounded-full flex items-center justify-center shrink-0 bg-red-100">
+            <Icons.Trash className="w-5 h-5 text-red-600" />
+          </div>
+          <div>
+            <p className="font-semibold text-gray-800 text-sm">Mover tarefa para a Lixeira?</p>
+            <p className="text-sm text-gray-500 mt-1">Esta tarefa permanecerá disponível para restauração durante 30 dias. Após esse período, ela será excluída permanentemente.</p>
+          </div>
+        </div>
+        <div>
+          <p className="text-xs font-semibold text-gray-500 mb-2">Por que esta tarefa está sendo excluída? (opcional)</p>
+          <div className="flex flex-col gap-1.5">
+            {DELETION_REASONS.map(r => (
+              <label key={r.code} className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                <input
+                  type="radio"
+                  name="deletion_reason"
+                  checked={reasonCode === r.code}
+                  onChange={() => setReasonCode(r.code)}
+                  className="accent-red-500"
+                />
+                {r.label}
+              </label>
+            ))}
+          </div>
+          {reasonCode && (
+            <textarea
+              value={reasonText}
+              onChange={(e) => setReasonText(e.target.value)}
+              placeholder="Detalhes adicionais (opcional)"
+              rows={2}
+              className="mt-2 w-full text-sm border rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-red-200"
+            />
+          )}
+        </div>
+        <div className="flex gap-2 justify-end">
+          <button onClick={onClose} className="px-4 py-2 text-sm rounded-lg border text-gray-600 hover:bg-gray-50">Cancelar</button>
+          <button
+            onClick={() => onConfirm(reasonCode, reasonText.trim() || null)}
+            className="px-4 py-2 text-sm rounded-lg text-white font-bold bg-red-600 hover:bg-red-700"
+          >
+            Mover para Lixeira
+          </button>
         </div>
       </div>
     </div>
@@ -9917,6 +10181,7 @@ function TaskDetailModal(props: any) {
     onDuplicate,
     onArchive,
     onUnarchive,
+    onRestore,
     onConfigureRecurrence,
     recurrenceRule,
     tasks,
@@ -10504,7 +10769,19 @@ function TaskDetailModal(props: any) {
                 </button>
               )
             )}
-            {!isReadOnly && (task.archivedAt ? onUnarchive : onArchive) && (
+            {/* Issue #185, gota 4: uma tarefa na Lixeira só mostra Restaurar
+                (seção 32 da issue) — arquivar/desarquivar e mover pra Lixeira
+                de novo não fazem sentido nesse estado. */}
+            {!isReadOnly && task.deletedAt && onRestore && (
+              <button
+                onClick={() => onRestore(task)}
+                className="flex items-center gap-2 px-3 py-1.5 hover:bg-emerald-50 text-emerald-600 text-sm font-medium rounded-lg transition-all"
+                title="Restaurar tarefa"
+              >
+                <RotateCcw className="w-4 h-4" /> Restaurar
+              </button>
+            )}
+            {!isReadOnly && !task.deletedAt && (task.archivedAt ? onUnarchive : onArchive) && (
               <button
                 onClick={task.archivedAt ? onUnarchive : onArchive}
                 className="flex items-center gap-2 px-3 py-1.5 hover:bg-amber-50 text-gray-500 hover:text-amber-600 text-sm font-medium rounded-lg transition-all"
@@ -10513,8 +10790,8 @@ function TaskDetailModal(props: any) {
                 <ArchiveIcon className="w-4 h-4" /> {task.archivedAt ? 'Desarquivar' : 'Arquivar'}
               </button>
             )}
-            {!isReadOnly && onDelete && (
-              <button onClick={onDelete} className="p-2 hover:bg-red-50 text-red-400 rounded-lg transition-colors" title="Excluir Tarefa">
+            {!isReadOnly && !task.deletedAt && onDelete && (
+              <button onClick={onDelete} className="p-2 hover:bg-red-50 text-red-400 rounded-lg transition-colors" title="Mover para Lixeira">
                 <Icons.Trash />
               </button>
             )}
@@ -10540,6 +10817,14 @@ function TaskDetailModal(props: any) {
                     title={`Arquivada em ${formatDate(task.archivedAt)}${task.archivedBy ? ' por ' + (users.find((u: any) => u.id === task.archivedBy)?.name || 'alguém') : ''}`}
                   >
                     <ArchiveIcon className="w-3 h-3" /> Arquivada
+                  </span>
+                )}
+                {task.deletedAt && (
+                  <span
+                    className="flex items-center gap-1.5 px-2 py-1 bg-red-50 text-red-700 rounded text-[10px] font-bold uppercase"
+                    title={`Excluída em ${formatDate(task.deletedAt)}${task.deletedBy ? ' por ' + (users.find((u: any) => u.id === task.deletedBy)?.name || 'alguém') : ''}${task.purgeAfter ? ' · exclusão definitiva em ' + formatDate(task.purgeAfter) : ''}`}
+                  >
+                    <Icons.Trash className="w-3 h-3" /> Na Lixeira
                   </span>
                 )}
                 <button
